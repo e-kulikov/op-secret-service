@@ -4834,7 +4834,7 @@ git commit -m "feat(cli): add doctor and config init"
 **Files:**
 - Create: `tests/clients.rs`, `tests/fixtures/go-keyring/main.go`, `tests/fixtures/go-keyring/go.mod`, `tests/fixtures/go-keyring/go.sum`
 
-Runs real clients against the daemon: the Go `go-keyring` library (the keyring layer of the GitHub and GitLab CLIs), Python's `keyring` with SecretStorage (which negotiates the DH session), and `secret-tool`. A missing client skips its test unless `OP_SECRETD_REQUIRE_CLIENTS` is set. These tests are compatibility checks for code that already exists, so they are expected to pass on the first run; a failure points at a protocol deviation.
+Runs real clients against the daemon: the Go `go-keyring` library (the keyring layer of the GitHub and GitLab CLIs), Python's `keyring` with SecretStorage (which negotiates the DH session), and `secret-tool`. A missing client, or a tool that is only a version-manager shim, skips its test unless `OP_SECRETD_REQUIRE_CLIENTS` is set. These tests are compatibility checks for code that already exists, so they are expected to pass on the first run; a failure points at a protocol deviation.
 
 **Interfaces:**
 - Consumes: `Harness`, the daemon binary.
@@ -4943,11 +4943,23 @@ assert kr.get_password("gh:github.com", "bob") is None
 print("delete ok")
 "#;
 
-fn available(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .is_ok_and(|output| output.status.success())
+/// True when `program args` succeeds and prints `expected`. Checking the output
+/// rejects version-manager shims that answer every invocation with their own banner.
+fn available(program: &str, args: &[&str], expected: &str) -> bool {
+    for _ in 0..10 {
+        match Command::new(program).args(args).output() {
+            // A script that was written a moment ago can still be busy (ETXTBSY).
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => return false,
+            Ok(output) => {
+                return output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(expected);
+            }
+        }
+    }
+    false
 }
 
 /// True when the client can run; panics instead of skipping when clients are required.
@@ -4971,10 +4983,27 @@ fn expect_success(what: &str, output: &Output) {
     );
 }
 
+#[test]
+fn a_shim_that_ignores_its_arguments_is_not_a_client() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let write_tool = |name: &str, output: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho '{output}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    };
+    // A version-manager shim answers every invocation with its own banner.
+    let shim = write_tool("go-shim", "mise 2026.9.1 linux-x64");
+    let real = write_tool("go-real", "go version go1.26 linux/amd64");
+    assert!(!available(&shim, &["version"], "go version"));
+    assert!(available(&real, &["version"], "go version"));
+}
+
 #[tokio::test]
 async fn go_keyring_roundtrip() {
     // zalando/go-keyring is the library behind the GitHub and GitLab CLIs.
-    if !client_available("go", available("go", &["version"])) {
+    if !client_available("go", available("go", &["version"], "go version")) {
         return;
     }
     let mut harness = Harness::new();
@@ -5004,7 +5033,11 @@ async fn python_keyring_roundtrip() {
     let python = std::env::var("OP_SECRETD_TEST_PYTHON").unwrap_or_else(|_| "python3".into());
     if !client_available(
         "python keyring",
-        available(&python, &["-c", "import keyring, secretstorage"]),
+        available(
+            &python,
+            &["-c", "import keyring, secretstorage; print(\"ok\")"],
+            "ok",
+        ),
     ) {
         return;
     }
@@ -5021,7 +5054,7 @@ async fn python_keyring_roundtrip() {
 
 #[tokio::test]
 async fn secret_tool_roundtrip() {
-    if !client_available("secret-tool", available("secret-tool", &["--version"])) {
+    if !client_available("secret-tool", available("secret-tool", &["--version"], "")) {
         return;
     }
     let mut harness = Harness::new();
@@ -5070,7 +5103,7 @@ async fn secret_tool_roundtrip() {
 ```bash
 cargo test --test clients
 ```
-Expected: PASS (three tests; tests whose client is not installed print `SKIPPED` and pass).
+Expected: PASS (four tests: one checks that a version-manager shim is not mistaken for a client, three run real clients; a client that is not installed prints `SKIPPED` and its test passes).
 
 - [ ] **Step 6: Check formatting and lints**
 
