@@ -1,0 +1,62 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      OP_SECRETD_REQUIRE_CLIENTS: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends dbus libsecret-tools python3-venv shellcheck
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: tests/fixtures/go-keyring/go.mod
+
+      - name: Install the Python keyring client
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install keyring secretstorage
+          echo "OP_SECRETD_TEST_PYTHON=$RUNNER_TEMP/venv/bin/python" >>"$GITHUB_ENV"
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustup default "$channel"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Check shell scripts
+        run: |
+          bash -n scripts/*.sh
+          shellcheck scripts/*.sh
+          scripts/test-release-scripts.sh
+
+      - name: Check commit messages
+        if: github.event_name == 'pull_request'
+        run: scripts/check-conventional-commits.sh "origin/${{ github.base_ref }}..HEAD"
