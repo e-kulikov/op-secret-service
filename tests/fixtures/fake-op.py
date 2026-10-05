@@ -120,14 +120,19 @@ elif command == ["item", "create"] and rest == ["-"]:
 elif command == ["item", "edit"] and rest[1:] == ["-"]:
     item = find(rest[0])
     template = json.loads(sys.stdin.read())
+    # Like the real op: built-in fields (those with a purpose) are updated in
+    # place, while the custom fields are replaced by the template's custom fields.
+    builtin = [field for field in item["fields"] if field.get("purpose")]
+    custom = []
     for incoming in template.get("fields", []):
-        for field in item["fields"]:
-            if incoming.get("id") and field["id"] == incoming["id"]:
-                field.update(incoming)
-                break
+        if incoming.get("purpose"):
+            for field in builtin:
+                if field.get("id") == incoming.get("id"):
+                    field.update(incoming)
         else:
             incoming.setdefault("id", "f%d" % counter())
-            item["fields"].append(incoming)
+            custom.append(incoming)
+    item["fields"] = builtin + custom
     write(item)
     print(json.dumps({"id": item["id"]}))
 elif command == ["item", "delete"]:

@@ -121,6 +121,11 @@ fn secret_fields(secret: &[u8]) -> (String, &'static str) {
 }
 
 /// Fields of an item template; `ids` supplies existing field ids when editing.
+///
+/// An edit must always send the complete set: the real `op item edit <item> -`
+/// replaces the custom fields with those of the template instead of merging
+/// them, so a partial template silently drops the rest (observed against a real
+/// vault, and mirrored by the fake `op` used in the tests).
 fn fields_json(
     label: &str,
     attributes: &Attributes,
