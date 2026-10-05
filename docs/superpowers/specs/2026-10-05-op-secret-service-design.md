@@ -41,24 +41,27 @@ wrappers.
 ## Architecture
 
 ```
-client (gh/glab/az) -D-Bus-> dbus -> SecretStore -> OpRunner -> op / op.exe
+client (gh/glab/az) -D-Bus-> dbus -> Store -> OpRunner -> op / op.exe
                                |          |
                         sessions+crypto   cache (memory, TTL, zeroize)
 ```
 
 Modules of a single crate:
 
-- `dbus`: the `Service`, `Collection`, `Item`, `Session`, and `Prompt` interfaces.
+- `dbus`: the `Service`, `Collection`, `Item`, and `Session` interfaces.
 - `crypto`: session encryption.
-- `store`: the `SecretStore` trait and the `OpStore` implementation.
-- `op`: the `OpRunner` trait and three ways to launch `op`.
-- `cache`: in-memory cache of secrets and the item index.
+- `attrs`: attribute maps, deterministic item identity, and the allow list.
+- `store`: the `Store` type, which keeps secrets as 1Password items.
+- `op`: the `OpRunner` type and three ways to launch `op`.
+- `cache`: an in-memory value with a time-to-live.
 - `config`: TOML loading and validation, environment overrides.
 - `lifecycle`: claiming the bus name, exiting when idle.
-- `cli`: the `serve`, `doctor`, and `config init` commands.
+- `doctor` and the `op-secretd` binary: the `serve`, `doctor`, and `config init`
+  commands.
 
-Boundaries: `dbus` knows only `SecretStore`; `store` knows only `OpRunner`;
-`OpRunner` knows nothing about Secret Service. Each layer is testable on its own.
+Boundaries: `dbus` knows only `Store`; `store` knows only `OpRunner`; `OpRunner`
+knows nothing about Secret Service. Each layer is testable on its own; tests
+replace the `op` executable with a fake script instead of mocking a trait.
 
 ## D-Bus API
 
@@ -74,8 +77,18 @@ The implementation covers the minimum needed by the target clients:
   properties `Items`, `Label`, `Locked`, `Created`, `Modified`.
 - Item: `GetSecret`, `SetSecret`, `Delete`; the properties `Attributes`,
   `Label`, `Type`, `Locked`, `Created`, `Modified`.
-- Session: `Close`. Prompt: a stub that always completes without asking, since
-  the collection is always unlocked and the real prompt comes from 1Password.
+- Session: `Close`.
+- No `Prompt` objects exist: the collection is always unlocked and the real
+  approval prompt comes from 1Password, so every method that may return a
+  prompt returns `/`.
+- `GetSecret` replies with a single `(oayays)` structure; clients such as
+  go-keyring reject a reply whose structure is flattened into four arguments.
+- `Created` and `Modified` are always `0`. `Collection.Items` lists the items
+  that currently have an object. Objects are exported by `SearchItems`,
+  `CreateItem`, and once in the background right after the daemon claims the bus
+  name; a property getter never exports objects because the D-Bus library holds
+  its object tree while a getter runs. An item created elsewhere therefore shows
+  up in `Items` after the next search.
 
 Session encryption: `plain` and `dh-ietf1024-sha256-aes128-cbc-pkcs7`.
 Unsupported algorithms return `org.freedesktop.DBus.Error.NotSupported`.
@@ -85,17 +98,24 @@ Unsupported algorithms return `org.freedesktop.DBus.Error.NotSupported`.
 One secret is one Password item in the configured vault:
 
 - Title: `secret-service/<sha256 of the canonical attribute string, 16 hex>`.
-  The canonical string is the sorted `key=value` pairs. An exact lookup (which
-  is how go-keyring searches, by `service` and `username`) is therefore a
-  single `op item get` by title.
-- Field `password`: the secret value. Non-UTF-8 data is base64-encoded and
-  marked in the `content_type` field.
-- Custom fields `attr.<name>`: the attributes; field `label`: the readable label.
+  The canonical string is the sorted attributes, each written as
+  `<key length>:<key>=<value length>:<value>`, so it is unambiguous. Writes can
+  therefore address an item directly by title.
+- Field `password`: the secret value. Non-UTF-8 data is base64-encoded and the
+  field `encoding` records `base64` (otherwise `utf-8`).
+- Field `attributes`: the attributes as one JSON object. A single field
+  round-trips empty values and any characters exactly.
+- Fields `label` (the readable label) and `content_type`.
 - Tag `secret-service` (configurable).
 
-A fuzzy search (a partial set of attributes) runs one
-`op item list --tags ... --format json | op item get - --format json` call; the
-resulting index is cached and invalidated on writes.
+Reads load an index of the whole tagged set with two `op` calls
+(`op item list --tags ... --format json`, then `op item get - --format json`
+fed with that list) and keep it in memory for `cache_ttl`. Searches, secret
+reads, and replace checks use the index; any write invalidates it. Items whose
+title does not match their attributes, or whose attributes fall outside the
+allow list, are ignored. Concurrent requests share one load.
+
+Deleting an item moves it to the 1Password archive.
 
 `CreateItem` with `replace = true` replaces the item with the same attributes;
 without `replace`, a collision returns the existing item, as most
@@ -113,6 +133,8 @@ implementations do.
 3. `service-account`: native `op` with `OP_SERVICE_ACCOUNT_TOKEN`, read from a
    file (mode `0600` is enforced) or from an environment variable and passed
    only in the child process environment, never in arguments.
+
+An explicit `op.binary` that ends in `.exe` selects `windows-interop`.
 
 `mode = auto`: on WSL (detected through `/proc/version` and `WSL_DISTRO_NAME`)
 `windows-interop` first, falling back to native `op` when `op.exe` is missing;
@@ -154,15 +176,18 @@ prints a clear result and exits 0 only when everything is fine.
 - If the name `org.freedesktop.secrets` is already taken (gnome-keyring,
   KeePassXC), the daemon does not start and reports who owns it.
 - After `idle_timeout` without requests the daemon exits; the cache disappears
-  with it.
+  with it. A request that is still in flight, for example while 1Password waits
+  for an approval, keeps the daemon alive; the timeout starts when the last
+  request finishes. A single `op` call is abandoned after 120 seconds.
 
 ## Errors and security
 
 - When `op` is unavailable, the user declines, or authorization has expired, the
   client receives a D-Bus error. An empty "secret not found" answer is allowed
   only when the item truly does not exist. This keeps a client from silently
-  falling back to a plaintext file. How `gh` reacts is covered by an
-  integration test (see "Verify during implementation").
+  falling back to a plaintext file. An integration test pins this behavior at
+  the protocol level; how the real `gh` reacts is a manual check (see
+  "Verify during implementation").
 - Secrets are held in `zeroize` buffers, never written to disk, and never logged;
   logs contain only identifiers and attribute hashes, not values.
 - Any process in the session that can talk to the bus can read the secrets, as
@@ -175,13 +200,18 @@ prints a clear result and exits 0 only when everything is fine.
 
 - Unit: attribute canonicalization, crypto (known vectors), cache and TTL,
   config parsing, WSL detection, `op.exe` lookup.
-- Integration: a private `dbus-daemon`, a fake `op` (a script emulating
-  `item get|create|edit|delete|list` and `read` on a file store), and the
-  clients `secret-tool`, python-keyring, and the real `gh`. Tests never touch
-  the real 1Password or user directories: every XDG variable points into a
-  temporary directory.
+- Integration: a private `dbus-daemon`, a fake `op` (a Python script emulating
+  `vault get` and `item list|get|create|edit|delete` on a file store, with
+  switches that make it fail or stall), the real daemon binary, and clients:
+  a Rust client that speaks the protocol directly (plain and DH sessions, error
+  paths, concurrency, empty, large, and binary secrets), the Go `go-keyring`
+  library that the GitHub and GitLab CLIs use, Python's `keyring`
+  (SecretStorage), and `secret-tool`. Tests never touch the real 1Password or
+  user directories: every XDG variable points into a temporary directory.
 - Manual checklist (not in CI): the real `op.exe` on WSL, a service account,
-  and native `op` on a clean Linux machine.
+  native `op` on a clean Linux machine, creating, replacing, and deleting items
+  in a real vault (the item template with custom fields), and the real `gh` and
+  `glab` login and logout.
 
 ## Release
 
@@ -197,29 +227,35 @@ Releases are automated with the stock `googleapis/release-please-action`
    after a successful `validate` check.
 4. Publication happens in the same workflow, with no separate tag-triggered
    workflow (a tag created by `GITHUB_TOKEN` does not trigger other workflows).
-   The release is created as a draft, then static musl binaries (x86_64,
-   aarch64), deterministic archives, `SHA256SUMS`, and attestations are built;
-   the package is verified (no `INTERP` or `NEEDED`, `--version` matches the
-   release version).
-5. Once all assets are uploaded and verified, the draft is published and the
-   `stable` branch is fast-forwarded. Tags are never moved. Re-running the
-   workflow is safe and reuses matching releases.
+   The release is created as a draft whose tag is created immediately
+   (`draft` and `force-tag-creation`). The verification suite runs against the
+   release, then static musl binaries (x86_64, aarch64) are built, checked (no
+   `INTERP` or `NEEDED`, `--version` matches the release version), and packaged
+   into deterministic archives; `SHA256SUMS` and build attestations are added.
+5. Once all assets are uploaded and verified against `SHA256SUMS`, the draft is
+   published and the `stable` branch is fast-forwarded. Tags are never moved.
+   Re-running the workflow is safe; if publication failed after the draft was
+   created, the workflow can be started manually with the draft's tag to build
+   and publish it again.
 6. Token: a fine-grained PAT in the `RELEASE_PLEASE_TOKEN` secret (Contents,
    Pull requests, Issues: read/write on this repository only), so that release
    PRs trigger CI. The token is never printed or committed.
 
 The build and packaging steps live in repository scripts
 (`scripts/validate-release-version.sh`, `scripts/package-release.sh`) so that
-they can be run and tested locally.
+they can be run and tested locally. A pull request check
+(`scripts/check-conventional-commits.sh`) rejects commit subjects that are not
+Conventional Commits.
 
 ## Packaging and installation
 
 Each release archive (`op-secretd_<version>_linux_<arch>.tar.gz`) contains:
 
 - the static `op-secretd` binary;
-- a systemd user unit and a D-Bus activation file (`org.freedesktop.secrets.service`);
-- a commented example `config.toml`;
-- the license.
+- `share/op-secretd/op-secretd.service` (systemd user unit) and
+  `share/op-secretd/org.freedesktop.secrets.service` (D-Bus activation file);
+- `share/op-secretd/config.example.toml`, produced by `op-secretd config init`;
+- `README.md` and `LICENSE`.
 
 The archive is installed by unpacking it: the binary goes on `PATH`, the unit
 and the activation file go into the user's systemd and D-Bus service
@@ -239,14 +275,20 @@ These points are not settled up front and are resolved by tests or documentation
 
 1. How `gh` reacts to a Secret Service error (silent fallback to a file or an
    explicit failure). A fallback needs a workaround.
-2. Which session scheme and attributes `gh`, `glab`, `az devops`, and Git
-   Credential Manager use, and whether the API subset above is sufficient.
+2. Whether `az devops` and Git Credential Manager work with the API subset above
+   (the Go `go-keyring` library and Python's SecretStorage are covered by tests).
 3. Whether `glab` stores an OAuth refresh token in the keyring; in any case we
    move to a PAT.
-4. Whether `op item list ... | op item get -` is fast enough for fuzzy search
-   with several hundred items.
+4. Whether the two-call index load (`op item list ... | op item get -`) is fast
+   enough with several hundred items.
 5. How the 1Password app handles approval prompts for a burst of quick requests
    through `op.exe` (request debouncing).
+6. Whether a real 1Password vault accepts the item template that the daemon
+   sends (custom fields without ids on create, fields addressed by id on edit)
+   and what its limits are for large field values.
+7. How release-please behaves on its first run with `draft` and
+   `force-tag-creation` (tag creation, the release pull request, and the next
+   run seeing the draft).
 
 ## Phase 2
 

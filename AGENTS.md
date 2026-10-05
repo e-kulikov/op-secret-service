@@ -46,9 +46,8 @@ move.
   `--locked`. Before reporting work as done run `cargo fmt --check`,
   `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`
   once the crate exists, and state any check that could not be run.
-- Keep the module boundaries from the spec: `dbus` knows only `SecretStore`,
-  `store` knows only `OpRunner`, and `OpRunner` knows nothing about Secret
-  Service.
+- Keep the module boundaries from the spec: `dbus` knows only `Store`, `store`
+  knows only `OpRunner`, and `OpRunner` knows nothing about Secret Service.
 - Secrets must never appear in process arguments, logs, error messages, test
   output, or the repository. Pass secret bodies to `op` as JSON on stdin and hold
   them in `zeroize` buffers.
