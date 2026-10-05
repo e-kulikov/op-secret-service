@@ -24,11 +24,23 @@ assert kr.get_password("gh:github.com", "bob") is None
 print("delete ok")
 "#;
 
-fn available(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .is_ok_and(|output| output.status.success())
+/// True when `program args` succeeds and prints `expected`. Checking the output
+/// rejects version-manager shims that answer every invocation with their own banner.
+fn available(program: &str, args: &[&str], expected: &str) -> bool {
+    for _ in 0..10 {
+        match Command::new(program).args(args).output() {
+            // A script that was written a moment ago can still be busy (ETXTBSY).
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => return false,
+            Ok(output) => {
+                return output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(expected);
+            }
+        }
+    }
+    false
 }
 
 /// True when the client can run; panics instead of skipping when clients are required.
@@ -52,10 +64,27 @@ fn expect_success(what: &str, output: &Output) {
     );
 }
 
+#[test]
+fn a_shim_that_ignores_its_arguments_is_not_a_client() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let write_tool = |name: &str, output: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho '{output}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    };
+    // A version-manager shim answers every invocation with its own banner.
+    let shim = write_tool("go-shim", "mise 2026.9.1 linux-x64");
+    let real = write_tool("go-real", "go version go1.26 linux/amd64");
+    assert!(!available(&shim, &["version"], "go version"));
+    assert!(available(&real, &["version"], "go version"));
+}
+
 #[tokio::test]
 async fn go_keyring_roundtrip() {
     // zalando/go-keyring is the library behind the GitHub and GitLab CLIs.
-    if !client_available("go", available("go", &["version"])) {
+    if !client_available("go", available("go", &["version"], "go version")) {
         return;
     }
     let mut harness = Harness::new();
@@ -85,7 +114,11 @@ async fn python_keyring_roundtrip() {
     let python = std::env::var("OP_SECRETD_TEST_PYTHON").unwrap_or_else(|_| "python3".into());
     if !client_available(
         "python keyring",
-        available(&python, &["-c", "import keyring, secretstorage"]),
+        available(
+            &python,
+            &["-c", "import keyring, secretstorage; print(\"ok\")"],
+            "ok",
+        ),
     ) {
         return;
     }
@@ -102,7 +135,7 @@ async fn python_keyring_roundtrip() {
 
 #[tokio::test]
 async fn secret_tool_roundtrip() {
-    if !client_available("secret-tool", available("secret-tool", &["--version"])) {
+    if !client_available("secret-tool", available("secret-tool", &["--version"], "")) {
         return;
     }
     let mut harness = Harness::new();
