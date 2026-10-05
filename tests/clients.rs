@@ -43,6 +43,19 @@ fn available(program: &str, args: &[&str], expected: &str) -> bool {
     false
 }
 
+/// True when `program` can be started at all, whatever its exit status.
+fn installed(program: &str) -> bool {
+    for _ in 0..10 {
+        match Command::new(program).arg("--version").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            result => return result.is_ok(),
+        }
+    }
+    false
+}
+
 /// True when the client can run; panics instead of skipping when clients are required.
 fn client_available(name: &str, present: bool) -> bool {
     if !present {
@@ -62,6 +75,18 @@ fn expect_success(what: &str, output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn a_tool_that_exits_non_zero_without_arguments_is_still_installed() {
+    // `secret-tool --version` prints its usage and exits with status 2.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = dir.path().join("usage-only");
+    std::fs::write(&tool, "#!/bin/sh\necho 'usage: tool store' >&2\nexit 2\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(installed(tool.to_str().unwrap()));
+    assert!(!installed("/nonexistent/definitely-not-a-tool"));
 }
 
 #[test]
@@ -135,7 +160,7 @@ async fn python_keyring_roundtrip() {
 
 #[tokio::test]
 async fn secret_tool_roundtrip() {
-    if !client_available("secret-tool", available("secret-tool", &["--version"], "")) {
+    if !client_available("secret-tool", installed("secret-tool")) {
         return;
     }
     let mut harness = Harness::new();
