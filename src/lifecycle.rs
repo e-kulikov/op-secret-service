@@ -17,7 +17,7 @@ use crate::store::Store;
 pub const BUS_NAME: &str = "org.freedesktop.secrets";
 
 fn bus_error(error: impl std::fmt::Display) -> Error {
-    Error::Internal(format!("D-Bus: {error}"))
+    Error::Bus(error.to_string())
 }
 
 /// Best-effort description of the process that owns `BUS_NAME`.
@@ -39,7 +39,7 @@ pub async fn describe_owner(connection: &Connection) -> String {
 
 async fn claim_name(connection: &Connection) -> Result<()> {
     let owned_elsewhere = |owner: String| {
-        Error::Internal(format!(
+        Error::NameTaken(format!(
             "{BUS_NAME} is already owned by {owner}; stop that provider first"
         ))
     };

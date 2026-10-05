@@ -504,6 +504,11 @@ async fn a_second_provider_cannot_take_the_name() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("already owned"), "{stderr}");
+    assert!(
+        !stderr.contains("internal error"),
+        "a taken name is not an internal error: {stderr}"
+    );
+    assert!(stderr.contains("stop that provider first"), "{stderr}");
 }
 
 #[tokio::test]

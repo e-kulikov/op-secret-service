@@ -16,6 +16,10 @@ pub enum Error {
     NotSupported(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+    #[error("D-Bus error: {0}")]
+    Bus(String),
+    #[error("{0}")]
+    NameTaken(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
