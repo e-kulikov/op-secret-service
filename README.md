@@ -94,7 +94,31 @@ secret-tool store --label=demo service demo username me
 ```
 
 `op-secretd doctor` checks the configuration, access to the vault, the session
-bus and the supported session algorithms.
+bus, the supported session algorithms, and whether `gh` or `glab` keep a token in
+a plaintext configuration file.
+
+**Log in only while `op-secretd doctor` is green.** When the keyring cannot be
+written (the daemon is not running, 1Password is unreachable, or an approval was
+declined), `gh` and `glab` silently store the token in their plaintext
+configuration file instead. `gh` offers `--insecure-storage` but no switch that
+forbids the fallback, so the daemon cannot prevent it. After logging in, make sure
+`doctor` reports no plaintext tokens; if it does, run `gh auth logout` and
+`gh auth login` again while the daemon is healthy.
+
+## Troubleshooting
+
+- **A client fails with `authorization prompt dismissed`:** the approval prompt in
+  the 1Password app was closed or the app was locked and not unlocked. Retry the
+  command and approve the prompt.
+- **A client hangs for about two minutes right after the daemon failed to start:**
+  D-Bus waits for its activation timeout after a failed start. Fix the cause
+  (`op-secretd doctor` names it), then start the unit once with
+  `systemctl --user start op-secretd.service`.
+- **The daemon reports that the configuration is missing:** the packaged systemd
+  unit uses a private `/tmp`, so keep the configuration in
+  `$XDG_CONFIG_HOME/op-secretd/` rather than under `/tmp`.
+- **`org.freedesktop.secrets is already owned by ...`:** another Secret Service
+  provider (gnome-keyring, KeePassXC) is running; stop it first.
 
 ## Security notes
 

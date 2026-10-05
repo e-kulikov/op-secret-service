@@ -23,11 +23,11 @@
 
 ## Review Focus
 
-- A client that silently falls back to plaintext storage when the daemon fails (expected: a D-Bus error, never an empty answer): `failures_surface_as_errors_not_empty_results`, and the manual checklist.
+- A client that silently falls back to plaintext storage when the daemon fails (expected from the daemon: a D-Bus error, never an empty answer; the real `gh` and `glab` fall back anyway, which the daemon cannot prevent, so `doctor` must warn about plaintext tokens without ever printing them): `failures_surface_as_errors_not_empty_results`, `doctor_warns_about_plaintext_tokens_but_still_passes`, `a_gh_token_in_hosts_yml_is_reported_without_its_value`, and the manual checklist.
 - A request that waits for a 1Password approval while the idle timeout elapses (expected: the daemon stays alive until the request finishes): `idle_exit_waits_for_a_request_in_flight`.
 - Several commands at once on a cold cache (expected: one 1Password load, not one prompt each): `concurrent_requests_share_one_index_load`.
 - Empty, 64 KiB, and non-UTF-8 secrets, and attributes with empty values, `=`, newlines, or non-ASCII text (expected: exact round trip): `empty_large_and_binary_secrets_roundtrip`, `empty_secrets_roundtrip`, `odd_attribute_values_survive`.
-- Another Secret Service provider already running, or a client that sends a malformed request (expected: a clear message or `InvalidArgs`, no crash): `a_second_provider_cannot_take_the_name`, `bad_requests_are_rejected`, `closing_a_session_invalidates_it`.
+- Another Secret Service provider already running, or a client that sends a malformed request (expected: a clear message that is not labeled an internal error, or `InvalidArgs`, no crash): `a_second_provider_cannot_take_the_name`, `bad_requests_are_rejected`, `closing_a_session_invalidates_it`.
 
 ---
 
@@ -41,7 +41,7 @@ Create the branch and the crate skeleton: manifest, pinned toolchain, license, a
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `op_secretd::error::{Error, Result}` and `impl From<Error> for zbus::fdo::Error`; `Error` variants `Config`, `OpUnavailable`, `OpFailed`, `NotFound`, `NotPermitted`, `NotSupported`, `Invalid`, `Internal`.
+- Produces: `op_secretd::error::{Error, Result}` and `impl From<Error> for zbus::fdo::Error`; `Error` variants `Config`, `OpUnavailable`, `OpFailed`, `NotFound`, `NotPermitted`, `NotSupported`, `Invalid`, `Bus`, `NameTaken`, `Internal`.
 
 - [ ] **Step 1: Create a feature branch**
 
@@ -171,6 +171,10 @@ pub enum Error {
     NotSupported(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+    #[error("D-Bus error: {0}")]
+    Bus(String),
+    #[error("{0}")]
+    NameTaken(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -1798,7 +1802,7 @@ git commit -m "feat(op): run the 1Password CLI natively, through WSL, or with a 
 ### Task 5: Cache and store
 
 **Files:**
-- Create: `tests/fixtures/fake-op.py`, `src/cache.rs`, `src/store.rs`
+- Create: `tests/fixtures/fake-op.py`, `tests/fake_op.rs`, `src/cache.rs`, `src/store.rs`
 - Modify: `src/lib.rs`
 
 Adds the in-memory `TtlCell`, the fake `op` used by every later test, and `Store`, which keeps each secret as a Password item and serves reads from a cached index. The fake `op` is a small Python script that emulates the few `op` commands the daemon uses on a directory of JSON files; creating `$FAKE_OP_DB/FAIL` makes every call fail and `$FAKE_OP_DB/SLOW` (seconds) delays every call.
@@ -1934,14 +1938,19 @@ elif command == ["item", "create"] and rest == ["-"]:
 elif command == ["item", "edit"] and rest[1:] == ["-"]:
     item = find(rest[0])
     template = json.loads(sys.stdin.read())
+    # Like the real op: built-in fields (those with a purpose) are updated in
+    # place, while the custom fields are replaced by the template's custom fields.
+    builtin = [field for field in item["fields"] if field.get("purpose")]
+    custom = []
     for incoming in template.get("fields", []):
-        for field in item["fields"]:
-            if incoming.get("id") and field["id"] == incoming["id"]:
-                field.update(incoming)
-                break
+        if incoming.get("purpose"):
+            for field in builtin:
+                if field.get("id") == incoming.get("id"):
+                    field.update(incoming)
         else:
             incoming.setdefault("id", "f%d" % counter())
-            item["fields"].append(incoming)
+            custom.append(incoming)
+    item["fields"] = builtin + custom
     write(item)
     print(json.dumps({"id": item["id"]}))
 elif command == ["item", "delete"]:
@@ -1951,7 +1960,119 @@ else:
     fail("fake op: unsupported command: " + " ".join(args))
 ```
 
-- [ ] **Step 2: Declare the modules in `src/lib.rs`**
+- [ ] **Step 2: Create `tests/fake_op.rs`, which pins the fake's behavior to what the real `op item edit -` does (it replaces the custom fields instead of merging them; observed against a real vault)**
+
+`tests/fake_op.rs`:
+
+```rust
+//! The fake `op` must behave like the real one where the daemon depends on it.
+
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+const FAKE_OP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-op.py");
+
+fn fake(db: &Path, args: &[&str], stdin: Option<&str>) -> String {
+    let mut child = Command::new("python3")
+        .arg(FAKE_OP)
+        .args(args)
+        .env("FAKE_OP_DB", db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if let Some(text) = stdin {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn labels(db: &Path) -> Vec<String> {
+    let item: serde_json::Value =
+        serde_json::from_str(&fake(db, &["item", "get", "t", "--vault", "V"], None)).unwrap();
+    item["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|field| field["label"].as_str().map(str::to_owned))
+        .collect()
+}
+
+const CREATE: &str = r#"{"title":"t","tags":["x"],"fields":[
+    {"id":"password","purpose":"PASSWORD","label":"password","type":"CONCEALED","value":"old"},
+    {"label":"label","type":"STRING","value":"keep me"}]}"#;
+
+#[test]
+fn a_partial_template_edit_drops_the_custom_fields_like_the_real_op() {
+    // Observed against a real vault: `op item edit <item> -` with a template
+    // replaces the custom fields instead of merging them.
+    let dir = tempfile::tempdir().unwrap();
+    fake(
+        dir.path(),
+        &["item", "create", "--vault", "V", "-"],
+        Some(CREATE),
+    );
+    assert!(labels(dir.path()).contains(&"label".to_owned()));
+
+    fake(
+        dir.path(),
+        &["item", "edit", "t", "--vault", "V", "-"],
+        Some(r#"{"fields":[{"id":"password","value":"new"}]}"#),
+    );
+    assert!(
+        !labels(dir.path()).contains(&"label".to_owned()),
+        "a partial edit must lose the custom `label` field"
+    );
+}
+
+#[test]
+fn a_complete_template_edit_keeps_every_field() {
+    let dir = tempfile::tempdir().unwrap();
+    fake(
+        dir.path(),
+        &["item", "create", "--vault", "V", "-"],
+        Some(CREATE),
+    );
+    fake(
+        dir.path(),
+        &["item", "edit", "t", "--vault", "V", "-"],
+        Some(
+            r#"{"fields":[
+            {"id":"password","purpose":"PASSWORD","label":"password","type":"CONCEALED","value":"new"},
+            {"label":"label","type":"STRING","value":"kept"}]}"#,
+        ),
+    );
+    assert!(labels(dir.path()).contains(&"label".to_owned()));
+    let item: serde_json::Value = serde_json::from_str(&fake(
+        dir.path(),
+        &["item", "get", "t", "--vault", "V"],
+        None,
+    ))
+    .unwrap();
+    let password = item["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "password")
+        .unwrap();
+    assert_eq!(password["value"], "new");
+}
+```
+
+- [ ] **Step 3: Declare the modules in `src/lib.rs`**
 
 `src/lib.rs`:
 
@@ -1965,7 +2086,7 @@ pub mod op;
 pub mod store;
 ```
 
-- [ ] **Step 3: Create `src/cache.rs` with only the tests**
+- [ ] **Step 4: Create `src/cache.rs` with only the tests**
 
 `src/cache.rs`:
 
@@ -2004,7 +2125,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Create `src/store.rs` with only the tests**
+- [ ] **Step 5: Create `src/store.rs` with only the tests**
 
 `src/store.rs`:
 
@@ -2332,14 +2453,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Run the tests to see them fail**
+- [ ] **Step 6: Run the tests to see them fail**
 
 ```bash
 cargo test --lib -- cache:: store::
 ```
 Expected: FAIL, compile errors (`TtlCell`, `Store` not found).
 
-- [ ] **Step 6: Write the implementation of `TtlCell`**
+- [ ] **Step 7: Write the implementation of `TtlCell`**
 
 Put this above the `#[cfg(test)]` line of `src/cache.rs`:
 
@@ -2383,7 +2504,7 @@ impl<T> TtlCell<T> {
 }
 ```
 
-- [ ] **Step 7: Write the implementation of `Store`**
+- [ ] **Step 8: Write the implementation of `Store`**
 
 Put this above the `#[cfg(test)]` line of `src/store.rs`. Reads load the whole tagged set with two `op` calls and cache it; writes address an item by its deterministic title and invalidate the cache:
 
@@ -2511,6 +2632,11 @@ fn secret_fields(secret: &[u8]) -> (String, &'static str) {
 }
 
 /// Fields of an item template; `ids` supplies existing field ids when editing.
+///
+/// An edit must always send the complete set: the real `op item edit <item> -`
+/// replaces the custom fields with those of the template instead of merging
+/// them, so a partial template silently drops the rest (observed against a real
+/// vault, and mirrored by the fake `op` used in the tests).
 fn fields_json(
     label: &str,
     attributes: &Attributes,
@@ -2740,24 +2866,31 @@ impl Store {
 }
 ```
 
-- [ ] **Step 8: Run the tests to see them pass**
+- [ ] **Step 9: Run the tests to see them pass**
 
 ```bash
 cargo test --lib
 ```
 Expected: PASS, 53 tests in total at this point.
 
-- [ ] **Step 9: Check formatting and lints**
+- [ ] **Step 10: Run the fixture tests**
+
+```bash
+cargo test --test fake_op
+```
+Expected: PASS, 2 tests (they check the fixture itself, so they pass on the first run).
+
+- [ ] **Step 11: Check formatting and lints**
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
 ```
 Expected: no output.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
-git add tests/fixtures/fake-op.py src/cache.rs src/store.rs src/lib.rs
+git add tests/fixtures/fake-op.py tests/fake_op.rs src/cache.rs src/store.rs src/lib.rs
 git commit -m "feat(store): keep secrets as 1Password items with an in-memory index"
 ```
 
@@ -3468,6 +3601,11 @@ async fn a_second_provider_cannot_take_the_name() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("already owned"), "{stderr}");
+    assert!(
+        !stderr.contains("internal error"),
+        "a taken name is not an internal error: {stderr}"
+    );
+    assert!(stderr.contains("stop that provider first"), "{stderr}");
 }
 
 #[tokio::test]
@@ -4216,7 +4354,7 @@ use crate::store::Store;
 pub const BUS_NAME: &str = "org.freedesktop.secrets";
 
 fn bus_error(error: impl std::fmt::Display) -> Error {
-    Error::Internal(format!("D-Bus: {error}"))
+    Error::Bus(error.to_string())
 }
 
 /// Best-effort description of the process that owns `BUS_NAME`.
@@ -4238,7 +4376,7 @@ pub async fn describe_owner(connection: &Connection) -> String {
 
 async fn claim_name(connection: &Connection) -> Result<()> {
     let owned_elsewhere = |owner: String| {
-        Error::Internal(format!(
+        Error::NameTaken(format!(
             "{BUS_NAME} is already owned by {owner}; stop that provider first"
         ))
     };
@@ -4421,11 +4559,11 @@ git commit -m "feat(dbus): serve the Secret Service API on the session bus"
 - Create: `tests/cli.rs`, `src/doctor.rs`
 - Modify: `src/lib.rs`, `src/main.rs`
 
-Adds `op-secretd doctor` (configuration, `op` resolution, vault access, bus name, session algorithms; exit code 0 only when every check passes) and `op-secretd config init [--force]`.
+Adds `op-secretd doctor` (configuration, `op` resolution, vault access, bus name, session algorithms, and a warning about plaintext `gh` and `glab` tokens; exit code 0 unless a check fails, a warning does not fail it) and `op-secretd config init [--force]`. The plaintext check exists because the real `gh` and `glab` silently store the token in their configuration file when the keyring write fails, so a successful login does not prove the token is in 1Password; it reports file paths only and never a value.
 
 **Interfaces:**
-- Consumes: `OpRunner`, `Config`, `lifecycle::{BUS_NAME, describe_owner}`, `crypto::{DhKeypair, negotiate}`, `Harness`.
-- Produces: `doctor::{Check, run(&Config, &Probe) -> Vec<Check>}`; the `doctor` and `config init` commands.
+- Consumes: `OpRunner`, `Config`, `Probe` (its `env` map), `lifecycle::{BUS_NAME, describe_owner}`, `crypto::{DhKeypair, negotiate}`, `Harness`.
+- Produces: `doctor::{Status::{Ok, Warn, Fail}, Check { name, status, detail }, plaintext_token_check(&HashMap<String, String>) -> Check, run(&Config, &Probe) -> Vec<Check>}`; the `doctor` and `config init` commands.
 
 - [ ] **Step 1: Create `tests/cli.rs`**
 
@@ -4492,6 +4630,7 @@ fn doctor_passes_with_a_working_setup() {
         "vault access",
         "session bus",
         "session algorithms",
+        "plaintext tokens",
     ] {
         assert!(
             stdout.contains(&format!("ok    {check}")),
@@ -4550,6 +4689,36 @@ async fn doctor_recognizes_a_running_daemon() {
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("is served by op-secretd"), "{stdout}");
 }
+
+#[test]
+fn doctor_warns_about_plaintext_tokens_but_still_passes() {
+    let harness = Harness::new();
+    let gh = harness.path("gh-config");
+    std::fs::create_dir_all(&gh).unwrap();
+    std::fs::write(
+        gh.join("hosts.yml"),
+        "github.com:\n    oauth_token: gho_plainsecret123456789\n    user: bob\n",
+    )
+    .unwrap();
+    let config = harness.write_config(&[]);
+    let output = harness
+        .daemon_command(&config)
+        .arg("doctor")
+        .env("GH_CONFIG_DIR", &gh)
+        .output()
+        .unwrap();
+    let stdout = text(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a warning must not fail doctor:\n{stdout}"
+    );
+    assert!(stdout.contains("warn  plaintext tokens"), "{stdout}");
+    assert!(stdout.contains("hosts.yml"), "{stdout}");
+    assert!(
+        !stdout.contains("gho_plainsecret123456789"),
+        "the token leaked:\n{stdout}"
+    );
+}
 ```
 
 - [ ] **Step 2: Run the tests to see them fail**
@@ -4559,12 +4728,157 @@ cargo test --test cli
 ```
 Expected: FAIL: the binary has no `doctor` or `config` command yet.
 
-- [ ] **Step 3: Create `src/doctor.rs`**
+- [ ] **Step 3: Declare the module in `src/lib.rs`**
+
+`src/lib.rs`:
+
+```rust
+pub mod attrs;
+pub mod cache;
+pub mod config;
+pub mod crypto;
+pub mod dbus;
+pub mod doctor;
+pub mod error;
+pub mod lifecycle;
+pub mod op;
+pub mod store;
+```
+
+- [ ] **Step 4: Create `src/doctor.rs` with only the unit tests of the plaintext token check**
 
 `src/doctor.rs`:
 
 ```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+
+    const SECRET: &str = "gho_plainsecret123456789";
+
+    fn env(pairs: &[(&str, &Path)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, path)| ((*key).to_owned(), path.display().to_string()))
+            .collect()
+    }
+
+    fn write(dir: &Path, name: &str, text: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn no_config_files_means_no_plaintext_tokens() {
+        let home = tempfile::tempdir().unwrap();
+        let check = plaintext_token_check(&env(&[("HOME", home.path())]));
+        assert_eq!(check.status, Status::Ok);
+        assert_eq!(check.name, "plaintext tokens");
+    }
+
+    #[test]
+    fn a_gh_token_in_hosts_yml_is_reported_without_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "hosts.yml",
+            &format!(
+                "github.com:\n    users:\n        bob:\n            oauth_token: {SECRET}\n    oauth_token: {SECRET}\n    user: bob\n"
+            ),
+        );
+        let check = plaintext_token_check(&env(&[("GH_CONFIG_DIR", dir.path())]));
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("hosts.yml"), "{}", check.detail);
+        assert!(
+            !check.detail.contains(SECRET),
+            "the value must never be printed"
+        );
+    }
+
+    #[test]
+    fn gh_in_keyring_mode_has_no_oauth_token_line() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "hosts.yml",
+            "github.com:\n    git_protocol: https\n    users:\n        bob:\n    user: bob\n",
+        );
+        let check = plaintext_token_check(&env(&[("GH_CONFIG_DIR", dir.path())]));
+        assert_eq!(check.status, Status::Ok, "{}", check.detail);
+    }
+
+    #[test]
+    fn glab_plaintext_tokens_are_reported_without_their_values() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.yml",
+            &format!(
+                "hosts:\n    gitlab.com:\n        token: {SECRET}\n        oauth2_refresh_token: {SECRET}\n        user: bob\n"
+            ),
+        );
+        let check = plaintext_token_check(&env(&[("GLAB_CONFIG_DIR", dir.path())]));
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("config.yml"), "{}", check.detail);
+        assert!(!check.detail.contains(SECRET));
+    }
+
+    #[test]
+    fn glab_with_empty_or_commented_token_fields_is_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.yml",
+            "hosts:\n    gitlab.com:\n        # Your GitLab access token. token: not-a-value\n        token:\n        job_token: ''\n        oauth2_refresh_token: \"\"\n        use_keyring: true\n",
+        );
+        let check = plaintext_token_check(&env(&[("GLAB_CONFIG_DIR", dir.path())]));
+        assert_eq!(check.status, Status::Ok, "{}", check.detail);
+    }
+
+    #[test]
+    fn xdg_config_home_is_searched_when_no_override_is_set() {
+        let xdg = tempfile::tempdir().unwrap();
+        write(
+            &xdg.path().join("gh"),
+            "hosts.yml",
+            &format!("github.com:\n    oauth_token: {SECRET}\n"),
+        );
+        let check = plaintext_token_check(&env(&[("XDG_CONFIG_HOME", xdg.path())]));
+        assert_eq!(check.status, Status::Warn);
+        write(
+            &xdg.path().join("glab-cli"),
+            "config.yml",
+            &format!("hosts:\n    x:\n        token: {SECRET}\n"),
+        );
+        let both = plaintext_token_check(&env(&[("XDG_CONFIG_HOME", xdg.path())]));
+        assert!(
+            both.detail.contains("hosts.yml") && both.detail.contains("config.yml"),
+            "{}",
+            both.detail
+        );
+    }
+}
+```
+
+- [ ] **Step 5: Run the tests to see them fail**
+
+```bash
+cargo test --lib doctor::
+```
+Expected: FAIL, compile errors (`plaintext_token_check` and `Status` do not exist yet).
+
+- [ ] **Step 6: Write the implementation of `doctor`**
+
+Put this above the `#[cfg(test)]` line of `src/doctor.rs`:
+
+```rust
 //! `op-secretd doctor`: checks that the daemon can run with this setup.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use zbus::fdo::DBusProxy;
 use zbus::names::BusName;
@@ -4574,9 +4888,17 @@ use crate::crypto::{ALGORITHM_DH, DhKeypair, negotiate};
 use crate::lifecycle::{BUS_NAME, describe_owner};
 use crate::op::{OpRunner, Probe};
 
+/// Outcome of one check. A warning is reported but does not fail `doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Ok,
+    Warn,
+    Fail,
+}
+
 pub struct Check {
     pub name: &'static str,
-    pub ok: bool,
+    pub status: Status,
     pub detail: String,
 }
 
@@ -4584,14 +4906,89 @@ fn check(name: &'static str, result: std::result::Result<String, String>) -> Che
     match result {
         Ok(detail) => Check {
             name,
-            ok: true,
+            status: Status::Ok,
             detail,
         },
         Err(detail) => Check {
             name,
-            ok: false,
+            status: Status::Fail,
             detail,
         },
+    }
+}
+
+/// True when a `key: value` line sets one of `keys` to a non-empty value.
+fn sets_secret(line: &str, keys: &[&str]) -> bool {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return false;
+    }
+    let Some((key, value)) = line.split_once(':') else {
+        return false;
+    };
+    let value = value.trim();
+    keys.contains(&key.trim()) && !matches!(value, "" | "''" | "\"\"" | "null" | "~" | "!!null")
+}
+
+fn config_dir(
+    env: &HashMap<String, String>,
+    override_var: &str,
+    xdg_name: &str,
+) -> Option<PathBuf> {
+    if let Some(dir) = env.get(override_var).filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(xdg) = env.get("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(xdg).join(xdg_name));
+    }
+    env.get("HOME")
+        .map(|home| PathBuf::from(home).join(".config").join(xdg_name))
+}
+
+/// Warns about GitHub and GitLab CLI tokens kept in plaintext configuration files.
+///
+/// `gh` and `glab` silently fall back to those files when the keyring cannot be
+/// written, so a successful login does not prove the token is in 1Password. Only
+/// file paths are reported, never values.
+pub fn plaintext_token_check(env: &HashMap<String, String>) -> Check {
+    let targets = [
+        (
+            config_dir(env, "GH_CONFIG_DIR", "gh"),
+            "hosts.yml",
+            &["oauth_token"][..],
+        ),
+        (
+            config_dir(env, "GLAB_CONFIG_DIR", "glab-cli"),
+            "config.yml",
+            &["token", "oauth2_refresh_token"][..],
+        ),
+    ];
+    let mut found = Vec::new();
+    for (dir, file, keys) in targets {
+        let Some(path) = dir.map(|dir| dir.join(file)) else {
+            continue;
+        };
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && text.lines().any(|line| sets_secret(line, keys))
+        {
+            found.push(path.display().to_string());
+        }
+    }
+    if found.is_empty() {
+        return Check {
+            name: "plaintext tokens",
+            status: Status::Ok,
+            detail: "no GitHub or GitLab CLI tokens in plaintext configuration".into(),
+        };
+    }
+    Check {
+        name: "plaintext tokens",
+        status: Status::Warn,
+        detail: format!(
+            "{} hold a token in plaintext; gh and glab fall back to it silently when the keyring fails. \
+             With the daemon healthy, log out and log in again to move it into 1Password",
+            found.join(", ")
+        ),
     }
 }
 
@@ -4649,28 +5046,12 @@ pub async fn run(config: &Config, probe: &Probe) -> Vec<Check> {
     }
     checks.push(check("session bus", session_bus_check().await));
     checks.push(check("session algorithms", algorithms_check()));
+    checks.push(plaintext_token_check(&probe.env));
     checks
 }
 ```
 
-- [ ] **Step 4: Declare the module in `src/lib.rs`**
-
-`src/lib.rs`:
-
-```rust
-pub mod attrs;
-pub mod cache;
-pub mod config;
-pub mod crypto;
-pub mod dbus;
-pub mod doctor;
-pub mod error;
-pub mod lifecycle;
-pub mod op;
-pub mod store;
-```
-
-- [ ] **Step 5: Replace `src/main.rs` with the full command line**
+- [ ] **Step 7: Replace `src/main.rs` with the full command line**
 
 `src/main.rs`:
 
@@ -4680,6 +5061,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use op_secretd::config;
+use op_secretd::doctor::Status;
 use op_secretd::error::{Error, Result};
 use op_secretd::op::Probe;
 use op_secretd::{doctor, lifecycle};
@@ -4779,14 +5161,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             };
             let checks = doctor::run(&config, &Probe::real()).await;
             for check in &checks {
-                println!(
-                    "{}  {}: {}",
-                    if check.ok { "ok  " } else { "FAIL" },
-                    check.name,
-                    check.detail
-                );
+                let label = match check.status {
+                    Status::Ok => "ok  ",
+                    Status::Warn => "warn",
+                    Status::Fail => "FAIL",
+                };
+                println!("{label}  {}: {}", check.name, check.detail);
             }
-            Ok(if checks.iter().all(|check| check.ok) {
+            Ok(if checks.iter().all(|check| check.status != Status::Fail) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
@@ -4807,21 +5189,21 @@ async fn main() -> ExitCode {
 }
 ```
 
-- [ ] **Step 6: Run all tests**
+- [ ] **Step 8: Run all tests**
 
 ```bash
 cargo test
 ```
-Expected: PASS: 53 library, 6 CLI, and 14 protocol tests.
+Expected: PASS: 59 library tests (53 plus 6 for `doctor`), 2 fixture tests, 7 CLI tests, and 14 protocol tests.
 
-- [ ] **Step 7: Check formatting and lints**
+- [ ] **Step 9: Check formatting and lints**
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
 ```
 Expected: no output.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add src tests/cli.rs
@@ -5769,7 +6151,31 @@ secret-tool store --label=demo service demo username me
 ```
 
 `op-secretd doctor` checks the configuration, access to the vault, the session
-bus and the supported session algorithms.
+bus, the supported session algorithms, and whether `gh` or `glab` keep a token in
+a plaintext configuration file.
+
+**Log in only while `op-secretd doctor` is green.** When the keyring cannot be
+written (the daemon is not running, 1Password is unreachable, or an approval was
+declined), `gh` and `glab` silently store the token in their plaintext
+configuration file instead. `gh` offers `--insecure-storage` but no switch that
+forbids the fallback, so the daemon cannot prevent it. After logging in, make sure
+`doctor` reports no plaintext tokens; if it does, run `gh auth logout` and
+`gh auth login` again while the daemon is healthy.
+
+## Troubleshooting
+
+- **A client fails with `authorization prompt dismissed`:** the approval prompt in
+  the 1Password app was closed or the app was locked and not unlocked. Retry the
+  command and approve the prompt.
+- **A client hangs for about two minutes right after the daemon failed to start:**
+  D-Bus waits for its activation timeout after a failed start. Fix the cause
+  (`op-secretd doctor` names it), then start the unit once with
+  `systemctl --user start op-secretd.service`.
+- **The daemon reports that the configuration is missing:** the packaged systemd
+  unit uses a private `/tmp`, so keep the configuration in
+  `$XDG_CONFIG_HOME/op-secretd/` rather than under `/tmp`.
+- **`org.freedesktop.secrets is already owned by ...`:** another Secret Service
+  provider (gnome-keyring, KeePassXC) is running; stop it first.
 
 ## Security notes
 
@@ -5874,7 +6280,10 @@ the store, or the release workflow. Use a throwaway vault.
   `gh api user` work afterwards; the plaintext `hosts.yml` has no token.
 - [ ] `gh auth logout` removes the item (it moves to the archive).
 - [ ] With the daemon unable to reach 1Password (for example the vault renamed),
-  `gh` reports an error and does **not** fall back to a plaintext token file.
+  `gh auth login` falls back to a plaintext token file without any warning (known
+  `gh` behavior); `op-secretd doctor` then reports `warn  plaintext tokens`, and
+  after `gh auth logout` and a login with a healthy daemon the warning is gone.
+  Use an isolated `GH_CONFIG_DIR` and a token you can revoke.
 - [ ] `glab auth login --use-keyring` with a personal access token works and
   survives a day without re-authentication.
 - [ ] `git` with `gh auth git-credential` and `glab auth git-credential`

@@ -117,6 +117,11 @@ allow list, are ignored. Concurrent requests share one load.
 
 Deleting an item moves it to the 1Password archive.
 
+Replacing an item always sends the complete field set. The real
+`op item edit <item> -` replaces the custom fields with those of the template
+instead of merging them, so a partial template would silently drop the rest.
+The fake `op` used in the tests reproduces this behavior.
+
 `CreateItem` with `replace = true` replaces the item with the same attributes;
 without `replace`, a collision returns the existing item, as most
 implementations do.
@@ -166,8 +171,11 @@ service_account_token_env = ""    # environment variable name
 
 `op-secretd config init` writes a commented file. `op-secretd doctor` checks
 that `op` is found, the vault is reachable, the token file permissions are
-correct, the bus name is free, and the session algorithms are supported. It
-prints a clear result and exits 0 only when everything is fine.
+correct, the bus name is free, and the session algorithms are supported. It also
+warns when `gh` or `glab` keep a token in a plaintext configuration file (only
+the file paths are reported, never values). It prints a clear result per check
+(`ok`, `warn`, or `FAIL`) and exits 0 unless a check failed; a warning does not
+fail it.
 
 ## Lifecycle
 
@@ -186,8 +194,13 @@ prints a clear result and exits 0 only when everything is fine.
   client receives a D-Bus error. An empty "secret not found" answer is allowed
   only when the item truly does not exist. This keeps a client from silently
   falling back to a plaintext file. An integration test pins this behavior at
-  the protocol level; how the real `gh` reacts is a manual check (see
-  "Verify during implementation").
+  the protocol level.
+- The real `gh` and `glab` nevertheless fall back silently: when writing to the
+  keyring fails (the daemon is down, 1Password is unreachable, an approval was
+  declined), `gh auth login` stores the token in `hosts.yml` and exits 0 with no
+  warning. `gh` has `--insecure-storage` but no switch that forbids the fallback,
+  so the daemon cannot prevent it. The mitigation is procedural: log in only while
+  `doctor` is green, and `doctor` warns about plaintext tokens afterwards.
 - Secrets are held in `zeroize` buffers, never written to disk, and never logged;
   logs contain only identifiers and attribute hashes, not values.
 - Any process in the session that can talk to the bus can read the secrets, as
@@ -199,13 +212,15 @@ prints a clear result and exits 0 only when everything is fine.
 ## Testing
 
 - Unit: attribute canonicalization, crypto (known vectors), cache and TTL,
-  config parsing, WSL detection, `op.exe` lookup.
+  config parsing, WSL detection, `op.exe` lookup, and the detection of plaintext
+  `gh` and `glab` tokens on mock configuration files (values are never printed).
 - Integration: a private `dbus-daemon`, a fake `op` (a Python script emulating
   `vault get` and `item list|get|create|edit|delete` on a file store, with
-  switches that make it fail or stall), the real daemon binary, and clients:
-  a Rust client that speaks the protocol directly (plain and DH sessions, error
-  paths, concurrency, empty, large, and binary secrets), the Go `go-keyring`
-  library that the GitHub and GitLab CLIs use, Python's `keyring`
+  switches that make it fail or stall, and with the field-replacing edit
+  semantics of the real `op`, which its own tests pin), the real daemon binary,
+  and clients: a Rust client that speaks the protocol directly (plain and DH
+  sessions, error paths, concurrency, empty, large, and binary secrets), the Go
+  `go-keyring` library that the GitHub and GitLab CLIs use, Python's `keyring`
   (SecretStorage), and `secret-tool`. Tests never touch the real 1Password or
   user directories: every XDG variable points into a temporary directory.
 - Manual checklist (not in CI): the real `op.exe` on WSL, a service account,
@@ -269,26 +284,47 @@ Client setup after installation: `gh auth login` and
 1Password. For `glab`, a personal access token is used instead of OAuth because
 OAuth access tokens expire quickly.
 
-## Verify during implementation
+## Verified manually against real services
 
-These points are not settled up front and are resolved by tests or documentation:
+Checked on 2026-10-05 against a real 1Password account (WSL, Windows `op.exe`)
+with a throwaway vault, which was deleted afterwards:
 
-1. How `gh` reacts to a Secret Service error (silent fallback to a file or an
-   explicit failure). A fallback needs a workaround.
-2. Whether `az devops` and Git Credential Manager work with the API subset above
+- `doctor`, the Python `keyring` (DH session) and Go `go-keyring` clients, secrets
+  of 64 KiB and non-UTF-8 secrets, deletion into the archive, and cache refresh
+  after an edit made outside the daemon all work.
+- A failing vault and a declined approval prompt reach the client as a D-Bus
+  error with a clear message; nothing is written in plaintext by the daemon.
+- A systemd user unit with `Type=dbus`, D-Bus activation, idle exit, and the
+  refusal to start next to another provider work. The packaged unit uses a
+  private `/tmp`, so the configuration must not live there. After a failed start
+  the next activation can wait for the bus's 120 s timeout until the unit is
+  started once by hand.
+- `gh` (web login): the token is stored in the vault, `hosts.yml` holds none,
+  `gh api user` and a `git clone` of a private repository through
+  `gh auth git-credential` work, and `gh auth logout` removes the item.
+- `glab` (device login): both the access token and the OAuth refresh token are
+  stored in the vault, the configuration file holds neither, and `glab api user`
+  works. Whether a refreshed token round-trips after its two-hour expiry was not
+  waited for.
+- `gh` falls back to plaintext when the keyring write fails (see "Errors and
+  security").
+- A real vault accepts the item template the daemon sends: custom fields without
+  ids on create, the complete field set on edit.
+
+## Open verification points
+
+These points are not settled and are resolved by tests or documentation:
+
+1. Whether `az devops` and Git Credential Manager work with the API subset above
    (the Go `go-keyring` library and Python's SecretStorage are covered by tests).
-3. Whether `glab` stores an OAuth refresh token in the keyring; in any case we
-   move to a PAT.
-4. Whether the two-call index load (`op item list ... | op item get -`) is fast
-   enough with several hundred items.
-5. How the 1Password app handles approval prompts for a burst of quick requests
-   through `op.exe` (request debouncing).
-6. Whether a real 1Password vault accepts the item template that the daemon
-   sends (custom fields without ids on create, fields addressed by id on edit)
-   and what its limits are for large field values.
-7. How release-please behaves on its first run with `draft` and
+2. Whether the two-call index load (`op item list ... | op item get -`) is fast
+   enough with several hundred items, and how the 1Password app handles a burst
+   of quick requests through `op.exe`.
+3. The limits of a real vault for field values larger than 64 KiB.
+4. How release-please behaves on its first run with `draft` and
    `force-tag-creation` (tag creation, the release pull request, and the next
    run seeing the draft).
+5. Service account mode and the native Linux `op` signed in with an account.
 
 ## Phase 2
 

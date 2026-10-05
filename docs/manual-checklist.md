@@ -38,7 +38,10 @@ the store, or the release workflow. Use a throwaway vault.
   `gh api user` work afterwards; the plaintext `hosts.yml` has no token.
 - [ ] `gh auth logout` removes the item (it moves to the archive).
 - [ ] With the daemon unable to reach 1Password (for example the vault renamed),
-  `gh` reports an error and does **not** fall back to a plaintext token file.
+  `gh auth login` falls back to a plaintext token file without any warning (known
+  `gh` behavior); `op-secretd doctor` then reports `warn  plaintext tokens`, and
+  after `gh auth logout` and a login with a healthy daemon the warning is gone.
+  Use an isolated `GH_CONFIG_DIR` and a token you can revoke.
 - [ ] `glab auth login --use-keyring` with a personal access token works and
   survives a day without re-authentication.
 - [ ] `git` with `gh auth git-credential` and `glab auth git-credential`
