@@ -1,0 +1,45 @@
+[package]
+name = "op-secretd"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Freedesktop Secret Service provider backed by 1Password"
+license = "MIT"
+repository = "https://github.com/e-kulikov/op-secret-service"
+publish = false
+
+[lib]
+name = "op_secretd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "op-secretd"
+path = "src/main.rs"
+
+[dependencies]
+aes = "0.9"
+base64 = "0.22"
+cbc = { version = "0.2", features = ["alloc"] }
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+hkdf = "0.13"
+num-bigint = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process", "sync", "io-util", "fs"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
