@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use op_secretd::config;
+use op_secretd::doctor::Status;
 use op_secretd::error::{Error, Result};
 use op_secretd::op::Probe;
 use op_secretd::{doctor, lifecycle};
@@ -102,14 +103,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             };
             let checks = doctor::run(&config, &Probe::real()).await;
             for check in &checks {
-                println!(
-                    "{}  {}: {}",
-                    if check.ok { "ok  " } else { "FAIL" },
-                    check.name,
-                    check.detail
-                );
+                let label = match check.status {
+                    Status::Ok => "ok  ",
+                    Status::Warn => "warn",
+                    Status::Fail => "FAIL",
+                };
+                println!("{label}  {}: {}", check.name, check.detail);
             }
-            Ok(if checks.iter().all(|check| check.ok) {
+            Ok(if checks.iter().all(|check| check.status != Status::Fail) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE

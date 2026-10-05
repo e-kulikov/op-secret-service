@@ -58,6 +58,7 @@ fn doctor_passes_with_a_working_setup() {
         "vault access",
         "session bus",
         "session algorithms",
+        "plaintext tokens",
     ] {
         assert!(
             stdout.contains(&format!("ok    {check}")),
@@ -115,4 +116,34 @@ async fn doctor_recognizes_a_running_daemon() {
     let stdout = text(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("is served by op-secretd"), "{stdout}");
+}
+
+#[test]
+fn doctor_warns_about_plaintext_tokens_but_still_passes() {
+    let harness = Harness::new();
+    let gh = harness.path("gh-config");
+    std::fs::create_dir_all(&gh).unwrap();
+    std::fs::write(
+        gh.join("hosts.yml"),
+        "github.com:\n    oauth_token: gho_plainsecret123456789\n    user: bob\n",
+    )
+    .unwrap();
+    let config = harness.write_config(&[]);
+    let output = harness
+        .daemon_command(&config)
+        .arg("doctor")
+        .env("GH_CONFIG_DIR", &gh)
+        .output()
+        .unwrap();
+    let stdout = text(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a warning must not fail doctor:\n{stdout}"
+    );
+    assert!(stdout.contains("warn  plaintext tokens"), "{stdout}");
+    assert!(stdout.contains("hosts.yml"), "{stdout}");
+    assert!(
+        !stdout.contains("gho_plainsecret123456789"),
+        "the token leaked:\n{stdout}"
+    );
 }
