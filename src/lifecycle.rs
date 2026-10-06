@@ -9,7 +9,7 @@ use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
 use zbus::names::BusName;
 
 use crate::config::Config;
-use crate::dbus::{State, preload, serve_objects};
+use crate::dbus::{State, serve_objects};
 use crate::error::{Error, Result};
 use crate::op::{OpRunner, Probe};
 use crate::store::Store;
@@ -98,11 +98,5 @@ pub async fn serve(config: Config, probe: Probe) -> Result<()> {
         .map_err(bus_error)?;
     claim_name(&connection).await?;
     tracing::info!("serving {BUS_NAME}");
-    let (preload_connection, preload_state) = (connection.clone(), state.clone());
-    tokio::spawn(async move {
-        if let Err(error) = preload(&preload_connection, &preload_state).await {
-            tracing::warn!(%error, "could not list the existing items yet");
-        }
-    });
     wait_for_exit(&state, config.idle_timeout).await
 }

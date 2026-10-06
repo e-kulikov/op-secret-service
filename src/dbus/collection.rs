@@ -75,7 +75,9 @@ impl Collection {
         Err(Error::NotSupported("the login collection cannot be deleted".into()).into())
     }
 
-    /// Items that already have an object; see `preload` for why this never exports.
+    /// Items that already have an object. A getter must not export objects (the
+    /// D-Bus library holds its object tree while a getter runs), so items appear
+    /// here after `SearchItems`, `CreateItem`, or another method has exported them.
     #[zbus(property)]
     async fn items(&self) -> Vec<OwnedObjectPath> {
         let _busy = self.state.begin();

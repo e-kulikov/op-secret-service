@@ -490,7 +490,7 @@ async fn the_cache_is_shared_between_requests() {
         .lines()
         .filter(|line| line.starts_with("item get secret-service/"))
         .count();
-    assert_eq!(lists, 1, "only the startup load scans the vault:\n{log}");
+    assert_eq!(lists, 0, "exact reads never scan the vault:\n{log}");
     assert!(
         reads <= 2,
         "repeated reads of one item hit the cache after at most the existence check and one read:\n{log}"
@@ -613,5 +613,17 @@ async fn idle_exit_waits_for_a_request_in_flight() {
     assert_eq!(
         harness.wait_for_daemon_exit(std::time::Duration::from_secs(15)),
         Some(true)
+    );
+}
+
+#[tokio::test]
+async fn starting_the_daemon_does_not_scan_the_vault() {
+    let harness = harness().await;
+    // Give a would-be background scan time to start before looking at the log.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let log = std::fs::read_to_string(harness.db().join("calls.log")).unwrap_or_default();
+    assert!(
+        log.lines().all(|line| !line.starts_with("item ")),
+        "a started daemon must not touch 1Password until a client asks:\n{log}"
     );
 }

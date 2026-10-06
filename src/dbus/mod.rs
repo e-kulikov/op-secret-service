@@ -16,7 +16,6 @@ use zbus::Connection;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Type};
 use zeroize::Zeroizing;
 
-use crate::attrs::Attributes;
 use crate::crypto::SessionCipher;
 use crate::error::{Error, Result};
 use crate::store::{ItemInfo, Store};
@@ -193,16 +192,6 @@ pub async fn export_items(
         paths.push(path);
     }
     Ok(paths)
-}
-
-/// Exports every stored item once, so that `Collection.Items` is complete.
-///
-/// A property getter must not export objects itself: zbus holds the object
-/// tree while a getter runs and `ObjectServer::at` would deadlock.
-pub async fn preload(connection: &Connection, state: &Arc<State>) -> Result<()> {
-    let all = state.store.search(&Attributes::new()).await?;
-    export_items(connection, state, &all).await?;
-    Ok(())
 }
 
 /// Exports the service and collection objects on `builder`.
