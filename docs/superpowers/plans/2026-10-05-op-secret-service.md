@@ -6555,7 +6555,7 @@ git commit -m "build: add release packaging scripts"
 - Create: `.github/workflows/verify.yml`, `.github/workflows/release.yml`, `release-please-config.json`, `.release-please-manifest.json`
 - Modify: `README.md`
 
-`verify.yml` runs formatting, lints, the whole test suite with every real client required, the script tests, and (on pull requests) the commit-subject check. `release.yml` follows the release process of the spec: release-please maintains the release pull request and creates a draft release with its tag; the verification workflow runs against it; static musl binaries are built for both architectures and checked; the assets, checksums, and attestations are uploaded and re-verified; only then is the draft published and `stable` fast-forwarded. The `tag` input of the manual run recovers a draft whose publication failed.
+`verify.yml` runs formatting, lints, the whole test suite with every real client required, the script tests, and (on pull requests) the commit-subject check. `release.yml` follows the release process of the spec: release-please maintains the release pull request and creates a draft release with its tag; the verification workflow runs against it; static musl binaries are built for both architectures and checked; the assets and checksums (and attestations where the repository supports them) are uploaded and re-verified; only then is the draft published and `stable` fast-forwarded. The `tag` input of the manual run recovers a draft whose publication failed.
 
 **Interfaces:**
 - Consumes: `scripts/*`, `packaging/*`, the repository secret `RELEASE_PLEASE_TOKEN`.
@@ -6771,7 +6771,9 @@ jobs:
           sha256sum ./*.tar.gz | sed 's# \./# #' >SHA256SUMS
           sha256sum --check SHA256SUMS
 
+      # GitHub offers attestations only for public repositories (and paid plans).
       - uses: actions/attest-build-provenance@v4
+        if: ${{ !github.event.repository.private }}
         with:
           subject-path: |
             dist/*.tar.gz
@@ -7106,9 +7108,9 @@ the store, or the release workflow. Use a throwaway vault.
   runs verification, builds both archives, and uploads them with `SHA256SUMS`.
 - [ ] The draft is then published, `stable` points at the tagged commit, and the
   next push to `main` does not open a duplicate release pull request.
-- [ ] Downloading the archive, verifying the checksum and the attestation
-  (`gh attestation verify`), and following the README install steps yields a
-  working daemon.
+- [ ] Downloading the archive, verifying the checksum (and, for a public
+  repository, the attestation with `gh attestation verify`), and following the
+  README install steps yields a working daemon.
 ```
 
 - [ ] **Step 2: Check that no Cyrillic reached tracked files**

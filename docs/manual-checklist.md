@@ -62,6 +62,6 @@ the store, or the release workflow. Use a throwaway vault.
   runs verification, builds both archives, and uploads them with `SHA256SUMS`.
 - [ ] The draft is then published, `stable` points at the tagged commit, and the
   next push to `main` does not open a duplicate release pull request.
-- [ ] Downloading the archive, verifying the checksum and the attestation
-  (`gh attestation verify`), and following the README install steps yields a
-  working daemon.
+- [ ] Downloading the archive, verifying the checksum (and, for a public
+  repository, the attestation with `gh attestation verify`), and following the
+  README install steps yields a working daemon.
