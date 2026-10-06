@@ -134,7 +134,9 @@ jobs:
           sha256sum ./*.tar.gz | sed 's# \./# #' >SHA256SUMS
           sha256sum --check SHA256SUMS
 
+      # GitHub offers attestations only for public repositories (and paid plans).
       - uses: actions/attest-build-provenance@v4
+        if: ${{ !github.event.repository.private }}
         with:
           subject-path: |
             dist/*.tar.gz
