@@ -266,7 +266,8 @@ Releases are automated with the stock `googleapis/release-please-action`
    (`draft` and `force-tag-creation`). The verification suite runs against the
    release, then static musl binaries (x86_64, aarch64) are built, checked (no
    `INTERP` or `NEEDED`, `--version` matches the release version), and packaged
-   into deterministic archives; `SHA256SUMS` and build attestations are added.
+   into deterministic archives; `SHA256SUMS` is added, and so are build attestations when the repository
+   supports them (GitHub offers them for public repositories only).
 5. Once all assets are uploaded and verified against `SHA256SUMS`, the draft is
    published and the `stable` branch is fast-forwarded. Tags are never moved.
    Re-running the workflow is safe; if publication failed after the draft was
@@ -331,6 +332,12 @@ with a throwaway vault, which was deleted afterwards:
 - A real vault accepts the item template the daemon sends: custom fields without
   ids on create, the complete field set and the attribute tag on edit, and titles
   and tags that carry quotes, backslashes, non-ASCII text, and over a kilobyte.
+- The first release run: release-please opened the release pull request, its
+  merge created the tag and the draft release at once, both architectures built
+  and passed the static-binary checks, and the checksums matched. Build
+  attestations failed because GitHub does not offer them for private repositories
+  of a user account, so that step now runs only for public repositories; a
+  failed publication is recovered by starting the workflow with the draft's tag.
 - `secret-tool` stores, looks up, searches, and clears; `gh` re-login over an
   existing plaintext token moves it into the vault; `glab` refreshes an expired
   OAuth token through the keyring (access and refresh token are both replaced);
@@ -353,9 +360,9 @@ These points are not settled and are resolved by tests or documentation:
    subset search scales with hundreds of matching items (each match is one call,
    four at a time).
 3. The limits of a real vault for field values larger than 64 KiB.
-4. How release-please behaves on its first run with `draft` and
-   `force-tag-creation` (tag creation, the release pull request, and the next
-   run seeing the draft).
+4. How the release flow behaves on a second release: the release pull request
+   after a published release, and the release pull request when only
+   non-releasable commits (`ci`, `docs`) have landed.
 5. Service account mode and the native Linux `op` signed in with an account.
 6. Whether the D-Bus call timeouts of clients (25 s for libsecret) are enough when
    1Password is slow: a login that needs a miss, a read, and a create sat close to
