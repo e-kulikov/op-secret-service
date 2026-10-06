@@ -81,6 +81,7 @@ pub fn find_op_exe(probe: &Probe) -> Option<PathBuf> {
 }
 
 /// How the CLI is started.
+#[derive(Clone)]
 pub enum Launch {
     Native(PathBuf),
     Interop(PathBuf),
@@ -173,6 +174,7 @@ pub fn resolve(config: &Config, probe: &Probe) -> Result<Launch> {
 }
 
 /// Runs `op` with a fixed launch method and optional `--account`.
+#[derive(Clone)]
 pub struct OpRunner {
     launch: Launch,
     account: Option<String>,

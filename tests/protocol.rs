@@ -486,9 +486,14 @@ async fn the_cache_is_shared_between_requests() {
         .lines()
         .filter(|line| line.starts_with("item list"))
         .count();
-    assert_eq!(
-        lists, 2,
-        "one load for the create check, one after the write; reads hit the cache:\n{log}"
+    let reads = log
+        .lines()
+        .filter(|line| line.starts_with("item get secret-service/"))
+        .count();
+    assert_eq!(lists, 1, "only the startup load scans the vault:\n{log}");
+    assert!(
+        reads <= 2,
+        "repeated reads of one item hit the cache after at most the existence check and one read:\n{log}"
     );
 }
 
@@ -546,6 +551,14 @@ async fn concurrent_requests_share_one_index_load() {
     assert_eq!(
         lists, 1,
         "the startup load serves every concurrent search:\n{log}"
+    );
+    let reads = log
+        .lines()
+        .filter(|line| line.starts_with("item get secret-service/"))
+        .count();
+    assert!(
+        reads <= 1,
+        "concurrent identical searches share one read:\n{log}"
     );
 }
 
