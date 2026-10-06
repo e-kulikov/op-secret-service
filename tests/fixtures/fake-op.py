@@ -41,6 +41,10 @@ if os.path.exists(slow):
     import time
     time.sleep(float(open(slow).read() or "1"))
 
+# `FAIL_LIST` makes only `item list` fail, to test paths that must not depend on it.
+if args[:2] == ["item", "list"] and os.path.exists(os.path.join(db, "FAIL_LIST")):
+    fail("fake: listing is unavailable")
+
 # Drop global flags; remember the interesting ones.
 flags = {}
 positional = []

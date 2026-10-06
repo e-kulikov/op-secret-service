@@ -490,7 +490,10 @@ async fn the_cache_is_shared_between_requests() {
         .lines()
         .filter(|line| line.starts_with("item get secret-service/"))
         .count();
-    assert_eq!(lists, 0, "exact reads never scan the vault:\n{log}");
+    assert!(
+        lists <= 1,
+        "the listing is shared and cached, never repeated:\n{log}"
+    );
     assert!(
         reads <= 2,
         "repeated reads of one item hit the cache after at most the existence check and one read:\n{log}"

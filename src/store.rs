@@ -12,7 +12,9 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use zeroize::Zeroizing;
 
-use crate::attrs::{AllowList, Attributes, TITLE_PREFIX, item_key, item_title, matches};
+use crate::attrs::{
+    AllowList, Attributes, TITLE_PREFIX, attrs_tag, item_key, item_title, matches, parse_attrs_tag,
+};
 use crate::cache::TtlCell;
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -43,6 +45,14 @@ struct Record {
 
 type Index = BTreeMap<String, Record>;
 type Singles = HashMap<String, Option<Record>>;
+
+/// One line of `op item list`: enough to filter by attributes without reading the item.
+#[derive(Clone)]
+struct Entry {
+    id: String,
+    key: String,
+    attributes: Option<Attributes>,
+}
 
 /// How many `op item get` processes run at once while the index loads. The
 /// 1Password app rejects bursts: with eight at once about half of the calls failed.
@@ -180,6 +190,8 @@ pub struct Store {
     allow: AllowList,
     /// Every item of the tagged set, loaded on demand.
     index: Mutex<TtlCell<Index>>,
+    /// The listing of the tagged set: ids, keys, and attributes taken from the tags.
+    listing: Mutex<TtlCell<Vec<Entry>>>,
     /// Single items read by key (`None` remembers that the item does not exist).
     singles: Mutex<TtlCell<Singles>>,
     write_lock: Mutex<()>,
@@ -193,34 +205,60 @@ impl Store {
             tag: config.tag.clone(),
             allow: config.allow_list()?,
             index: Mutex::new(TtlCell::new(config.cache_ttl)),
+            listing: Mutex::new(TtlCell::new(config.cache_ttl)),
             singles: Mutex::new(TtlCell::new(config.cache_ttl)),
             write_lock: Mutex::new(()),
         })
     }
 
-    /// Loads the whole tagged set: one `op item list`, then the items by id in
-    /// parallel. Each `op` call costs seconds when it goes through Windows.
-    async fn load_index(&self) -> Result<Index> {
-        let listing = self
-            .op
-            .run(
-                &[
-                    "item",
-                    "list",
-                    "--vault",
-                    &self.vault,
-                    "--tags",
-                    &self.tag,
-                    "--format",
-                    "json",
-                ],
-                None,
-            )
-            .await?;
-        let ids: Vec<String> = parse_json_stream(&listing)?
-            .iter()
-            .filter_map(|item| item["id"].as_str().map(str::to_owned))
-            .collect();
+    /// One `op item list` for the tagged set. It is shared by concurrent callers
+    /// and cached; the attributes come from the `attrs:` tag, so no item is read.
+    async fn entries(&self) -> Result<Vec<Entry>> {
+        let mut cell = self.listing.lock().await;
+        if cell.fresh().is_none() {
+            let output = self
+                .op
+                .run(
+                    &[
+                        "item",
+                        "list",
+                        "--vault",
+                        &self.vault,
+                        "--tags",
+                        &self.tag,
+                        "--format",
+                        "json",
+                    ],
+                    None,
+                )
+                .await?;
+            let mut entries = Vec::new();
+            for item in parse_json_stream(&output)? {
+                let (Some(id), Some(title)) = (item["id"].as_str(), item["title"].as_str()) else {
+                    continue;
+                };
+                let Some(key) = title.strip_prefix(TITLE_PREFIX) else {
+                    continue;
+                };
+                let attributes = item["tags"].as_array().and_then(|tags| {
+                    tags.iter()
+                        .filter_map(|tag| tag.as_str())
+                        .find_map(parse_attrs_tag)
+                });
+                entries.push(Entry {
+                    id: id.to_owned(),
+                    key: key.to_owned(),
+                    attributes,
+                });
+            }
+            cell.set(entries);
+        }
+        Ok(cell.current().expect("the listing was just stored").clone())
+    }
+
+    /// Reads items by id, at most `PARALLEL_READS` at a time. An item deleted
+    /// since the listing is skipped; any other failure aborts the rest.
+    async fn read_items(&self, ids: Vec<String>) -> Result<Vec<Record>> {
         let limit = Arc::new(Semaphore::new(PARALLEL_READS));
         let mut tasks = JoinSet::new();
         for id in ids {
@@ -237,21 +275,85 @@ impl Store {
                 .await
             });
         }
-        let mut index = Index::new();
+        let mut records = Vec::new();
         while let Some(joined) = tasks.join_next().await {
             let output = match joined.map_err(|error| Error::Internal(error.to_string()))? {
                 Ok(output) => output,
-                // Deleted between the listing and the read.
                 Err(Error::NotFound) => continue,
                 Err(error) => return Err(error),
             };
             if let Some(record) = parse_item(&output)?
                 && self.allow.permits(&record.info.attributes)
             {
-                index.insert(record.info.key.clone(), record);
+                records.push(record);
             }
         }
-        Ok(index)
+        Ok(records)
+    }
+
+    /// Loads the whole tagged set: the listing, then every item.
+    async fn load_index(&self) -> Result<Index> {
+        let ids = self.entries().await?.into_iter().map(|e| e.id).collect();
+        Ok(self
+            .read_items(ids)
+            .await?
+            .into_iter()
+            .map(|record| (record.info.key.clone(), record))
+            .collect())
+    }
+
+    /// Keeps records that were read for a search, so a following `secret` needs no call.
+    async fn remember(&self, records: &[Record]) {
+        let mut singles = self.singles.lock().await;
+        if singles.fresh().is_none() {
+            singles.set(Singles::new());
+        }
+        if let Some(map) = singles.fresh_mut() {
+            for record in records {
+                map.insert(record.info.key.clone(), Some(record.clone()));
+            }
+        }
+    }
+
+    /// A search on a cold store: the item with exactly these attributes, else
+    /// every item whose attributes contain them.
+    async fn search_cold(&self, query: &Attributes) -> Result<Vec<ItemInfo>> {
+        let key = item_key(query);
+        // The exact read and the listing run side by side; the listing only
+        // matters on a miss, and each call costs seconds through Windows.
+        let (exact, entries) = tokio::join!(self.fetch_one(&key), self.entries());
+        if let Some(record) = exact? {
+            return Ok(vec![record.info]);
+        }
+        let candidates: Vec<Entry> = entries?
+            .into_iter()
+            .filter(|entry| {
+                entry.key != key
+                    && entry
+                        .attributes
+                        .as_ref()
+                        .is_some_and(|a| matches(query, a) && self.allow.permits(a))
+            })
+            .collect();
+        // Items read earlier are reused; only the others cost a call.
+        let mut records = Vec::new();
+        let mut missing = Vec::new();
+        {
+            let singles = self.singles.lock().await;
+            for entry in candidates {
+                match singles.fresh().and_then(|map| map.get(&entry.key)) {
+                    Some(Some(record)) => records.push(record.clone()),
+                    _ => missing.push(entry.id),
+                }
+            }
+        }
+        let fetched = self.read_items(missing).await?;
+        self.remember(&fetched).await;
+        records.extend(fetched);
+        records.retain(|record| matches(query, &record.info.attributes));
+        let mut found: Vec<ItemInfo> = records.into_iter().map(|record| record.info).collect();
+        found.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(found)
     }
 
     async fn with_index<T>(&self, f: impl FnOnce(&Index) -> T) -> Result<T> {
@@ -315,18 +417,18 @@ impl Store {
 
     async fn invalidate(&self) {
         self.index.lock().await.invalidate();
+        self.listing.lock().await.invalidate();
         self.singles.lock().await.invalidate();
     }
 
-    /// Items whose attributes contain every pair of `query`. When the query is
-    /// the exact attribute set of one item, that item is read directly and the
-    /// vault is scanned only if it does not exist.
+    /// Items whose attributes contain every pair of `query`.
+    ///
+    /// On a cold store a non-empty query costs one exact read and one listing run
+    /// side by side, plus a read of each other match; an empty query loads the
+    /// whole set; a loaded index answers any query from memory.
     pub async fn search(&self, query: &Attributes) -> Result<Vec<ItemInfo>> {
-        if !query.is_empty()
-            && !self.index_is_fresh()
-            && let Some(record) = self.fetch_one(&item_key(query)).await?
-        {
-            return Ok(vec![record.info]);
+        if !query.is_empty() && !self.index_is_fresh() {
+            return self.search_cold(query).await;
         }
         self.with_index(|index| {
             index
@@ -402,7 +504,7 @@ impl Store {
                     serde_json::to_vec(&json!({
                         "title": title,
                         "category": "PASSWORD",
-                        "tags": [self.tag],
+                        "tags": [self.tag, attrs_tag(&attributes)],
                         "fields": fields,
                     }))
                     .map_err(|e| Error::Internal(e.to_string()))?,
@@ -806,16 +908,22 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].key, key);
         let log = calls(dir.path());
-        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(
+            count(&log, "item get"),
+            1,
+            "only the exact item is read: {log:?}"
+        );
         assert!(
-            log[0].starts_with(&format!("item get secret-service/{key}")),
+            log.iter()
+                .any(|call| call.starts_with(&format!("item get secret-service/{key}"))),
             "{log:?}"
         );
+        assert!(count(&log, "item list") <= 1, "{log:?}");
 
         assert_eq!(&*cold.secret(&key).await.unwrap().0, b"tok");
         assert_eq!(
             calls(dir.path()).len(),
-            1,
+            log.len(),
             "the secret needs no further call"
         );
     }
@@ -840,7 +948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_miss_on_a_cold_store_falls_back_to_the_full_index() {
+    async fn a_subset_search_on_a_cold_store_finds_items_with_more_attributes() {
         let dir = tempfile::tempdir().unwrap();
         let writer = store_in(dir.path(), |_| {});
         let superset = attrs(&[
@@ -938,7 +1046,9 @@ mod tests {
         while let Some(found) = tasks.join_next().await {
             assert_eq!(found.unwrap(), 1);
         }
-        assert_eq!(calls(dir.path()).len(), 1, "{:?}", calls(dir.path()));
+        let log = calls(dir.path());
+        assert_eq!(count(&log, "item get"), 1, "one shared read: {log:?}");
+        assert_eq!(count(&log, "item list"), 1, "one shared listing: {log:?}");
     }
 
     #[tokio::test]
@@ -1000,5 +1110,120 @@ mod tests {
             .max()
             .unwrap();
         assert!((2..=4).contains(&peak), "peak concurrency was {peak}");
+    }
+
+    fn count(log: &[String], prefix: &str) -> usize {
+        log.iter().filter(|call| call.starts_with(prefix)).count()
+    }
+
+    #[tokio::test]
+    async fn items_are_tagged_with_their_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path(), |_| {});
+        let a = attrs(&[("service", "gh"), ("username", "")]);
+        let key = store
+            .create(a.clone(), "x", b"1", "text/plain", false)
+            .await
+            .unwrap()
+            .key;
+        let raw = std::fs::read_to_string(
+            dir.path()
+                .join(format!("db/items/secret-service__{key}.json")),
+        )
+        .unwrap();
+        let item: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let tags: Vec<&str> = item["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
+        assert!(tags.contains(&"secret-service"), "{tags:?}");
+        assert!(tags.contains(&attrs_tag(&a).as_str()), "{tags:?}");
+    }
+
+    #[tokio::test]
+    async fn a_subset_search_lists_once_and_reads_only_the_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = store_in(dir.path(), |_| {});
+        for n in 0..5 {
+            let noise = attrs(&[("service", "other"), ("n", &n.to_string())]);
+            writer
+                .create(noise, "noise", b"x", "text/plain", false)
+                .await
+                .unwrap();
+        }
+        let superset = attrs(&[
+            ("application", "py"),
+            ("service", "gh"),
+            ("username", "bob"),
+        ]);
+        writer
+            .create(superset.clone(), "gh", b"tok", "text/plain", false)
+            .await
+            .unwrap();
+        reset_calls(dir.path());
+
+        let cold = store_in(dir.path(), |_| {});
+        let query = attrs(&[("service", "gh"), ("username", "bob")]);
+        let found = cold.search(&query).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].attributes, superset);
+        let log = calls(dir.path());
+        assert_eq!(count(&log, "item list"), 1, "{log:?}");
+        assert_eq!(
+            count(&log, "item get"),
+            2,
+            "the exact try and the one match: {log:?}"
+        );
+        assert_eq!(&*cold.secret(&found[0].key).await.unwrap().0, b"tok");
+        assert_eq!(
+            count(&calls(dir.path()), "item get"),
+            2,
+            "the match is cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_without_matches_costs_one_exact_read_and_one_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cold) = vault_with_a_gh_item(dir.path()).await;
+        let none = attrs(&[("service", "nothing-like-this")]);
+        assert!(cold.search(&none).await.unwrap().is_empty());
+        let log = calls(dir.path());
+        assert_eq!(count(&log, "item list"), 1, "{log:?}");
+        assert_eq!(count(&log, "item get"), 1, "{log:?}");
+        assert!(cold.search(&none).await.unwrap().is_empty());
+        assert_eq!(
+            calls(dir.path()).len(),
+            log.len(),
+            "the repeat is served from memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_hit_does_not_depend_on_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cold) = vault_with_a_gh_item(dir.path()).await;
+        std::fs::write(dir.path().join("db/FAIL_LIST"), "").unwrap();
+        assert_eq!(cold.search(&gh_attrs()).await.unwrap().len(), 1);
+        let other = attrs(&[("service", "nothing-like-this")]);
+        assert!(
+            cold.search(&other).await.is_err(),
+            "a miss must not be answered as empty when the listing failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_attribute_filter_ignores_items_outside_the_allow_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = store_in(dir.path(), |_| {});
+        let hidden = attrs(&[("service", "gh"), ("username", "bob"), ("extra", "x")]);
+        writer
+            .create(hidden, "gh", b"tok", "text/plain", false)
+            .await
+            .unwrap();
+        let strict = store_in(dir.path(), |c| c.allow = vec!["service=glab".into()]);
+        assert!(strict.search(&gh_attrs()).await.unwrap().is_empty());
     }
 }

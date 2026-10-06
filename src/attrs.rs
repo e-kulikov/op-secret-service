@@ -42,6 +42,23 @@ pub fn item_title(attributes: &Attributes) -> String {
     format!("{TITLE_PREFIX}{}", item_key(attributes))
 }
 
+/// Prefix of the item tag that carries the attributes.
+pub const ATTRS_TAG_PREFIX: &str = "attrs:";
+
+/// The tag that stores the attributes of an item as one line of compact JSON.
+///
+/// `op item list` returns tags, so a search by a subset of the attributes needs a
+/// single listing instead of reading every item.
+pub fn attrs_tag(attributes: &Attributes) -> String {
+    let json = serde_json::to_string(attributes).expect("a string map serializes");
+    format!("{ATTRS_TAG_PREFIX}{json}")
+}
+
+/// The attributes stored in `tag`, if it is an attribute tag.
+pub fn parse_attrs_tag(tag: &str) -> Option<Attributes> {
+    serde_json::from_str(tag.strip_prefix(ATTRS_TAG_PREFIX)?).ok()
+}
+
 /// True when every pair of `query` is present in `item`.
 pub fn matches(query: &Attributes, item: &Attributes) -> bool {
     query
@@ -164,5 +181,36 @@ mod tests {
     fn allow_list_rejects_bad_patterns() {
         assert!(AllowList::new(&["nokey".into()]).is_err());
         assert!(AllowList::new(&["=x".into()]).is_err());
+    }
+
+    #[test]
+    fn the_attribute_tag_round_trips_exactly() {
+        let odd = attrs(&[
+            ("Service", "GitHub.COM:Token"),
+            ("empty", ""),
+            ("quote", "a\"b\\c,d;e/f"),
+            ("a=b", "line\nbreak"),
+            ("κλειδί", "τιμή\u{1F512}"),
+        ]);
+        let tag = attrs_tag(&odd);
+        assert!(tag.starts_with("attrs:{"), "{tag}");
+        assert!(!tag.contains('\n'), "a tag must stay on one line");
+        assert_eq!(parse_attrs_tag(&tag), Some(odd));
+        assert_eq!(parse_attrs_tag(&attrs_tag(&attrs(&[]))), Some(attrs(&[])));
+    }
+
+    #[test]
+    fn the_attribute_tag_is_independent_of_insertion_order() {
+        let a = attrs(&[("b", "2"), ("a", "1")]);
+        let b = attrs(&[("a", "1"), ("b", "2")]);
+        assert_eq!(attrs_tag(&a), attrs_tag(&b));
+    }
+
+    #[test]
+    fn other_tags_are_not_attribute_tags() {
+        assert_eq!(parse_attrs_tag("secret-service"), None);
+        assert_eq!(parse_attrs_tag("attrs:not json"), None);
+        assert_eq!(parse_attrs_tag("attrs:[1,2]"), None);
+        assert_eq!(parse_attrs_tag("xattrs:{}"), None);
     }
 }
