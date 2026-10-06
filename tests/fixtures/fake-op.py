@@ -5,6 +5,7 @@ State lives in $FAKE_OP_DB (items/*.json, calls.log). Creating the file
 $FAKE_OP_DB/FAIL makes every call fail like a dismissed approval prompt, and
 $FAKE_OP_DB/SLOW (seconds) delays every call like a pending approval.
 """
+import atexit
 import json
 import os
 import sys
@@ -25,6 +26,15 @@ def fail(message):
 
 if os.path.exists(os.path.join(db, "FAIL")):
     fail("authorization prompt dismissed")
+
+# Record how many fake ops run at the same time (tests read concurrency.log).
+running_dir = os.path.join(db, "running")
+os.makedirs(running_dir, exist_ok=True)
+marker = os.path.join(running_dir, str(os.getpid()))
+open(marker, "w").close()
+atexit.register(lambda: os.path.exists(marker) and os.remove(marker))
+with open(os.path.join(db, "concurrency.log"), "a") as handle:
+    handle.write("%d\n" % len(os.listdir(running_dir)))
 
 slow = os.path.join(db, "SLOW")
 if os.path.exists(slow):

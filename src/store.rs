@@ -44,8 +44,9 @@ struct Record {
 type Index = BTreeMap<String, Record>;
 type Singles = HashMap<String, Option<Record>>;
 
-/// How many `op item get` processes run at once while the index loads.
-const PARALLEL_READS: usize = 8;
+/// How many `op item get` processes run at once while the index loads. The
+/// 1Password app rejects bursts: with eight at once about half of the calls failed.
+const PARALLEL_READS: usize = 4;
 
 #[derive(Deserialize)]
 struct RawField {
@@ -972,5 +973,32 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[tokio::test]
+    async fn the_index_never_runs_more_than_four_reads_at_once() {
+        // The 1Password app rejects bursts: eight parallel `op.exe` calls made half of them fail.
+        let dir = tempfile::tempdir().unwrap();
+        let writer = store_in(dir.path(), |_| {});
+        for n in 0..10 {
+            let a = attrs(&[("service", "bulk"), ("n", &n.to_string())]);
+            writer
+                .create(a, "bulk", b"x", "text/plain", false)
+                .await
+                .unwrap();
+        }
+        let _ = std::fs::remove_file(dir.path().join("db/concurrency.log"));
+        std::fs::write(dir.path().join("db/SLOW"), "0.4").unwrap();
+
+        let cold = store_in(dir.path(), |_| {});
+        assert_eq!(cold.search(&attrs(&[])).await.unwrap().len(), 10);
+
+        let peak = std::fs::read_to_string(dir.path().join("db/concurrency.log"))
+            .unwrap()
+            .lines()
+            .map(|line| line.parse::<usize>().unwrap())
+            .max()
+            .unwrap();
+        assert!((2..=4).contains(&peak), "peak concurrency was {peak}");
     }
 }

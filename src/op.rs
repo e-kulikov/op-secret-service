@@ -17,6 +17,16 @@ use crate::error::{Error, Result};
 /// How long one `op` invocation may take, including waiting for the user to approve it.
 const OP_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Extra attempts after a transient failure of the 1Password client.
+const TRANSIENT_RETRIES: usize = 2;
+const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// The app's CLI integration sometimes refuses a call it would accept a moment later.
+fn is_transient(message: &str) -> bool {
+    message.contains("error initializing client")
+        || message.contains("make sure it is installed, running and CLI integration is enabled")
+}
+
 /// What the resolver looks at; replaceable in tests.
 #[derive(Debug, Clone)]
 pub struct Probe {
@@ -217,8 +227,25 @@ impl OpRunner {
         }
     }
 
-    /// Runs the CLI and returns stdout. `stdin` is passed as the child's standard input.
+    /// Runs the CLI and returns stdout. `stdin` is passed as the child's standard
+    /// input. Transient client errors are retried a couple of times.
     pub async fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+        let mut attempt = 0;
+        loop {
+            match self.run_once(args, stdin).await {
+                Err(Error::OpFailed(message))
+                    if attempt < TRANSIENT_RETRIES && is_transient(&message) =>
+                {
+                    attempt += 1;
+                    tracing::debug!(attempt, %message, "retrying a transient 1Password client error");
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn run_once(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
         let program = match &self.launch {
             Launch::Native(program) | Launch::Interop(program) => program,
             Launch::ServiceAccount { program, .. } => program,
@@ -539,5 +566,66 @@ echo ok"#,
             runner.run(&[], None).await,
             Err(Error::OpUnavailable(_))
         ));
+    }
+
+    /// A stand-in `op` that fails with `error` for its first `failures` runs and prints `ok` afterwards.
+    fn flaky_op(dir: &Path, failures: u32, error: &str) -> PathBuf {
+        let op = dir.join("op");
+        make_exe(
+            &op,
+            &format!(
+                r#"n=$(cat "$0.count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$0.count"
+if [ "$n" -le {failures} ]; then echo '[ERROR] 2026/10/06 {error}' >&2; exit 1; fi
+echo ok"#
+            ),
+        );
+        op
+    }
+
+    fn runs(op: &Path) -> u32 {
+        fs::read_to_string(format!("{}.count", op.display()))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn transient_client_errors_are_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        for error in [
+            "error initializing client: connection reset",
+            "make sure it is installed, running and CLI integration is enabled",
+        ] {
+            let op = flaky_op(dir.path(), 2, error);
+            let _ = fs::remove_file(format!("{}.count", op.display()));
+            let runner = OpRunner::new(Launch::Native(op.clone()), None);
+            assert_eq!(runner.run(&["x"], None).await.unwrap(), b"ok\n");
+            assert_eq!(runs(&op), 3, "two failures and one success for: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_errors_are_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = flaky_op(dir.path(), 99, "authorization prompt dismissed");
+        let runner = OpRunner::new(Launch::Native(op.clone()), None);
+        assert!(matches!(
+            runner.run(&["x"], None).await,
+            Err(Error::OpFailed(_))
+        ));
+        assert_eq!(runs(&op), 1);
+    }
+
+    #[tokio::test]
+    async fn a_transient_error_that_persists_is_reported_after_the_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = flaky_op(dir.path(), 99, "error initializing client");
+        let runner = OpRunner::new(Launch::Native(op.clone()), None);
+        match runner.run(&["x"], None).await {
+            Err(Error::OpFailed(message)) => assert!(message.contains("error initializing client")),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(runs(&op), 3, "one attempt and two retries");
     }
 }
