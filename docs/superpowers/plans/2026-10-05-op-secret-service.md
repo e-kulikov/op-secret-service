@@ -16,18 +16,18 @@
 - The D-Bus library is `zbus` 5 with `default-features = false` and the `tokio` feature.
 - Platforms: Linux (WSL2 and native). Release binaries are static musl builds for `x86_64` and `aarch64`.
 - Secrets never appear in process arguments, logs, error messages, test output, or the repository. Item bodies go to `op` as JSON on stdin and secret buffers are `zeroize`d.
-- Defaults: `mode = "auto"`, `tag = "secret-service"`, `cache_ttl = "5m"`, `idle_timeout = "15m"`; one `op` invocation is abandoned after 120 seconds.
+- Defaults: `mode = "auto"`, `tag = "secret-service"`, `cache_ttl = "5m"`, `idle_timeout = "1h"`; one `op` invocation is abandoned after 120 seconds, a transient client error is retried twice, and at most four `op` reads run in parallel.
 - Item titles are `secret-service/<16 hex digits>`; session algorithms are `plain` and `dh-ietf1024-sha256-aes128-cbc-pkcs7`.
 - Tests never touch a real 1Password account or real user directories; every XDG variable points into a temporary directory.
 - Commit messages are English Conventional Commits. `CHANGELOG.md`, `.release-please-manifest.json`, and the version in `Cargo.toml` belong to release-please. Documentation is English; the `.ru.md` translations stay untracked and no Cyrillic enters a committed file. Do not push, tag, or publish.
 
 ## Review Focus
 
-- A client that silently falls back to plaintext storage when the daemon fails (expected: a D-Bus error, never an empty answer): `failures_surface_as_errors_not_empty_results`, and the manual checklist.
+- A client that silently falls back to plaintext storage when the daemon fails (expected from the daemon: a D-Bus error, never an empty answer; the real `gh` and `glab` fall back anyway, which the daemon cannot prevent, so `doctor` must warn about plaintext tokens without ever printing them): `failures_surface_as_errors_not_empty_results`, `doctor_warns_about_plaintext_tokens_but_still_passes`, `a_gh_token_in_hosts_yml_is_reported_without_its_value`, and the manual checklist.
 - A request that waits for a 1Password approval while the idle timeout elapses (expected: the daemon stays alive until the request finishes): `idle_exit_waits_for_a_request_in_flight`.
 - Several commands at once on a cold cache (expected: one 1Password load, not one prompt each): `concurrent_requests_share_one_index_load`.
 - Empty, 64 KiB, and non-UTF-8 secrets, and attributes with empty values, `=`, newlines, or non-ASCII text (expected: exact round trip): `empty_large_and_binary_secrets_roundtrip`, `empty_secrets_roundtrip`, `odd_attribute_values_survive`.
-- Another Secret Service provider already running, or a client that sends a malformed request (expected: a clear message or `InvalidArgs`, no crash): `a_second_provider_cannot_take_the_name`, `bad_requests_are_rejected`, `closing_a_session_invalidates_it`.
+- Another Secret Service provider already running, or a client that sends a malformed request (expected: a clear message that is not labeled an internal error, or `InvalidArgs`, no crash): `a_second_provider_cannot_take_the_name`, `bad_requests_are_rejected`, `closing_a_session_invalidates_it`.
 
 ---
 
@@ -41,7 +41,7 @@ Create the branch and the crate skeleton: manifest, pinned toolchain, license, a
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `op_secretd::error::{Error, Result}` and `impl From<Error> for zbus::fdo::Error`; `Error` variants `Config`, `OpUnavailable`, `OpFailed`, `NotFound`, `NotPermitted`, `NotSupported`, `Invalid`, `Internal`.
+- Produces: `op_secretd::error::{Error, Result}` and `impl From<Error> for zbus::fdo::Error`; `Error` variants `Config`, `OpUnavailable`, `OpFailed`, `NotFound`, `NotPermitted`, `NotSupported`, `Invalid`, `Bus`, `NameTaken`, `Internal`.
 
 - [ ] **Step 1: Create a feature branch**
 
@@ -171,6 +171,10 @@ pub enum Error {
     NotSupported(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+    #[error("D-Bus error: {0}")]
+    Bus(String),
+    #[error("{0}")]
+    NameTaken(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -314,6 +318,37 @@ mod tests {
         assert!(AllowList::new(&["nokey".into()]).is_err());
         assert!(AllowList::new(&["=x".into()]).is_err());
     }
+
+    #[test]
+    fn the_attribute_tag_round_trips_exactly() {
+        let odd = attrs(&[
+            ("Service", "GitHub.COM:Token"),
+            ("empty", ""),
+            ("quote", "a\"b\\c,d;e/f"),
+            ("a=b", "line\nbreak"),
+            ("κλειδί", "τιμή\u{1F512}"),
+        ]);
+        let tag = attrs_tag(&odd);
+        assert!(tag.starts_with("attrs:{"), "{tag}");
+        assert!(!tag.contains('\n'), "a tag must stay on one line");
+        assert_eq!(parse_attrs_tag(&tag), Some(odd));
+        assert_eq!(parse_attrs_tag(&attrs_tag(&attrs(&[]))), Some(attrs(&[])));
+    }
+
+    #[test]
+    fn the_attribute_tag_is_independent_of_insertion_order() {
+        let a = attrs(&[("b", "2"), ("a", "1")]);
+        let b = attrs(&[("a", "1"), ("b", "2")]);
+        assert_eq!(attrs_tag(&a), attrs_tag(&b));
+    }
+
+    #[test]
+    fn other_tags_are_not_attribute_tags() {
+        assert_eq!(parse_attrs_tag("secret-service"), None);
+        assert_eq!(parse_attrs_tag("attrs:not json"), None);
+        assert_eq!(parse_attrs_tag("attrs:[1,2]"), None);
+        assert_eq!(parse_attrs_tag("xattrs:{}"), None);
+    }
 }
 ```
 
@@ -371,6 +406,23 @@ pub fn item_key(attributes: &Attributes) -> String {
 /// 1Password item title for an attribute set.
 pub fn item_title(attributes: &Attributes) -> String {
     format!("{TITLE_PREFIX}{}", item_key(attributes))
+}
+
+/// Prefix of the item tag that carries the attributes.
+pub const ATTRS_TAG_PREFIX: &str = "attrs:";
+
+/// The tag that stores the attributes of an item as one line of compact JSON.
+///
+/// `op item list` returns tags, so a search by a subset of the attributes needs a
+/// single listing instead of reading every item.
+pub fn attrs_tag(attributes: &Attributes) -> String {
+    let json = serde_json::to_string(attributes).expect("a string map serializes");
+    format!("{ATTRS_TAG_PREFIX}{json}")
+}
+
+/// The attributes stored in `tag`, if it is an attribute tag.
+pub fn parse_attrs_tag(tag: &str) -> Option<Attributes> {
+    serde_json::from_str(tag.strip_prefix(ATTRS_TAG_PREFIX)?).ok()
 }
 
 /// True when every pair of `query` is present in `item`.
@@ -503,8 +555,18 @@ mod tests {
         assert_eq!(config.vault, "Secret Service");
         assert_eq!(config.mode, Mode::Auto);
         assert_eq!(config.cache_ttl, Duration::from_secs(300));
-        assert_eq!(config.idle_timeout, Duration::from_secs(900));
+        assert_eq!(config.idle_timeout, Duration::from_secs(3600));
         assert_eq!(config.op.wsl_interop, Interop::Auto);
+    }
+
+    #[test]
+    fn the_example_matches_the_defaults() {
+        let example = Config::from_toml(EXAMPLE).unwrap();
+        let defaults = Config::default();
+        assert_eq!(example.cache_ttl, defaults.cache_ttl);
+        assert_eq!(example.idle_timeout, defaults.idle_timeout);
+        assert_eq!(example.tag, defaults.tag);
+        assert_eq!(defaults.idle_timeout, Duration::from_secs(3600));
     }
 
     #[test]
@@ -757,7 +819,7 @@ impl Default for Config {
             mode: Mode::Auto,
             tag: "secret-service".into(),
             cache_ttl: Duration::from_secs(300),
-            idle_timeout: Duration::from_secs(900),
+            idle_timeout: Duration::from_secs(3600),
             allow: Vec::new(),
             log_level: "info".into(),
             op: OpConfig::default(),
@@ -786,7 +848,7 @@ tag = "secret-service"
 cache_ttl = "5m"
 
 # The daemon exits after this long without requests. "0" disables it.
-idle_timeout = "15m"
+idle_timeout = "1h"
 
 # Attribute patterns (key=glob). Empty means everything is accepted.
 # Example: allow = ["service=gh:*", "service=glab*"]
@@ -1194,7 +1256,7 @@ git commit -m "feat(crypto): add Secret Service session encryption"
 - Create: `src/op.rs`
 - Modify: `src/lib.rs`
 
-Chooses how to start `op` (native, Windows `op.exe` through WSL interop, or native `op` with a service account token), runs it with a timeout, classifies its failures, and keeps the service account token out of arguments and out of unrelated children.
+Chooses how to start `op` (native, Windows `op.exe` through WSL interop, or native `op` with a service account token), runs it with a timeout, classifies its failures, retries transient client errors twice, and keeps the service account token out of arguments and out of unrelated children.
 
 **Interfaces:**
 - Consumes: `crate::config::{Config, Interop, Mode}`, `crate::error`.
@@ -1456,6 +1518,67 @@ echo ok"#,
             Err(Error::OpUnavailable(_))
         ));
     }
+
+    /// A stand-in `op` that fails with `error` for its first `failures` runs and prints `ok` afterwards.
+    fn flaky_op(dir: &Path, failures: u32, error: &str) -> PathBuf {
+        let op = dir.join("op");
+        make_exe(
+            &op,
+            &format!(
+                r#"n=$(cat "$0.count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$0.count"
+if [ "$n" -le {failures} ]; then echo '[ERROR] 2026/10/06 {error}' >&2; exit 1; fi
+echo ok"#
+            ),
+        );
+        op
+    }
+
+    fn runs(op: &Path) -> u32 {
+        fs::read_to_string(format!("{}.count", op.display()))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn transient_client_errors_are_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        for error in [
+            "error initializing client: connection reset",
+            "make sure it is installed, running and CLI integration is enabled",
+        ] {
+            let op = flaky_op(dir.path(), 2, error);
+            let _ = fs::remove_file(format!("{}.count", op.display()));
+            let runner = OpRunner::new(Launch::Native(op.clone()), None);
+            assert_eq!(runner.run(&["x"], None).await.unwrap(), b"ok\n");
+            assert_eq!(runs(&op), 3, "two failures and one success for: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_errors_are_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = flaky_op(dir.path(), 99, "authorization prompt dismissed");
+        let runner = OpRunner::new(Launch::Native(op.clone()), None);
+        assert!(matches!(
+            runner.run(&["x"], None).await,
+            Err(Error::OpFailed(_))
+        ));
+        assert_eq!(runs(&op), 1);
+    }
+
+    #[tokio::test]
+    async fn a_transient_error_that_persists_is_reported_after_the_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = flaky_op(dir.path(), 99, "error initializing client");
+        let runner = OpRunner::new(Launch::Native(op.clone()), None);
+        match runner.run(&["x"], None).await {
+            Err(Error::OpFailed(message)) => assert!(message.contains("error initializing client")),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(runs(&op), 3, "one attempt and two retries");
+    }
 }
 ```
 
@@ -1489,6 +1612,16 @@ use crate::error::{Error, Result};
 
 /// How long one `op` invocation may take, including waiting for the user to approve it.
 const OP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Extra attempts after a transient failure of the 1Password client.
+const TRANSIENT_RETRIES: usize = 2;
+const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// The app's CLI integration sometimes refuses a call it would accept a moment later.
+fn is_transient(message: &str) -> bool {
+    message.contains("error initializing client")
+        || message.contains("make sure it is installed, running and CLI integration is enabled")
+}
 
 /// What the resolver looks at; replaceable in tests.
 #[derive(Debug, Clone)]
@@ -1554,6 +1687,7 @@ pub fn find_op_exe(probe: &Probe) -> Option<PathBuf> {
 }
 
 /// How the CLI is started.
+#[derive(Clone)]
 pub enum Launch {
     Native(PathBuf),
     Interop(PathBuf),
@@ -1646,6 +1780,7 @@ pub fn resolve(config: &Config, probe: &Probe) -> Result<Launch> {
 }
 
 /// Runs `op` with a fixed launch method and optional `--account`.
+#[derive(Clone)]
 pub struct OpRunner {
     launch: Launch,
     account: Option<String>,
@@ -1688,8 +1823,25 @@ impl OpRunner {
         }
     }
 
-    /// Runs the CLI and returns stdout. `stdin` is passed as the child's standard input.
+    /// Runs the CLI and returns stdout. `stdin` is passed as the child's standard
+    /// input. Transient client errors are retried a couple of times.
     pub async fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+        let mut attempt = 0;
+        loop {
+            match self.run_once(args, stdin).await {
+                Err(Error::OpFailed(message))
+                    if attempt < TRANSIENT_RETRIES && is_transient(&message) =>
+                {
+                    attempt += 1;
+                    tracing::debug!(attempt, %message, "retrying a transient 1Password client error");
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn run_once(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
         let program = match &self.launch {
             Launch::Native(program) | Launch::Interop(program) => program,
             Launch::ServiceAccount { program, .. } => program,
@@ -1798,10 +1950,10 @@ git commit -m "feat(op): run the 1Password CLI natively, through WSL, or with a 
 ### Task 5: Cache and store
 
 **Files:**
-- Create: `tests/fixtures/fake-op.py`, `src/cache.rs`, `src/store.rs`
+- Create: `tests/fixtures/fake-op.py`, `tests/fake_op.rs`, `src/cache.rs`, `src/store.rs`
 - Modify: `src/lib.rs`
 
-Adds the in-memory `TtlCell`, the fake `op` used by every later test, and `Store`, which keeps each secret as a Password item and serves reads from a cached index. The fake `op` is a small Python script that emulates the few `op` commands the daemon uses on a directory of JSON files; creating `$FAKE_OP_DB/FAIL` makes every call fail and `$FAKE_OP_DB/SLOW` (seconds) delays every call.
+Adds the in-memory `TtlCell`, the fake `op` used by every later test, and `Store`, which keeps each secret as a Password item. Because each `op` call costs seconds through Windows, the store counts calls: an exact search reads one item by its title next to one listing, a subset search finds its matches from the `attrs:` tags of that listing and reads only them (four at a time), and everything is cached in memory. The fake `op` is a small Python script that emulates the few `op` commands the daemon uses on a directory of JSON files; creating `$FAKE_OP_DB/FAIL` makes every call fail and `$FAKE_OP_DB/SLOW` (seconds) delays every call.
 
 **Interfaces:**
 - Consumes: `crate::op::{OpRunner, Launch}`, `crate::attrs`, `crate::config::Config`, `crate::error`.
@@ -1819,6 +1971,7 @@ State lives in $FAKE_OP_DB (items/*.json, calls.log). Creating the file
 $FAKE_OP_DB/FAIL makes every call fail like a dismissed approval prompt, and
 $FAKE_OP_DB/SLOW (seconds) delays every call like a pending approval.
 """
+import atexit
 import json
 import os
 import sys
@@ -1840,10 +1993,23 @@ def fail(message):
 if os.path.exists(os.path.join(db, "FAIL")):
     fail("authorization prompt dismissed")
 
+# Record how many fake ops run at the same time (tests read concurrency.log).
+running_dir = os.path.join(db, "running")
+os.makedirs(running_dir, exist_ok=True)
+marker = os.path.join(running_dir, str(os.getpid()))
+open(marker, "w").close()
+atexit.register(lambda: os.path.exists(marker) and os.remove(marker))
+with open(os.path.join(db, "concurrency.log"), "a") as handle:
+    handle.write("%d\n" % len(os.listdir(running_dir)))
+
 slow = os.path.join(db, "SLOW")
 if os.path.exists(slow):
     import time
     time.sleep(float(open(slow).read() or "1"))
+
+# `FAIL_LIST` makes only `item list` fail, to test paths that must not depend on it.
+if args[:2] == ["item", "list"] and os.path.exists(os.path.join(db, "FAIL_LIST")):
+    fail("fake: listing is unavailable")
 
 # Drop global flags; remember the interesting ones.
 flags = {}
@@ -1876,12 +2042,16 @@ def load_all():
     return out
 
 
-def find(title):
-    path = path_for(title)
-    if not os.path.exists(path):
-        fail('"%s" isn\'t an item in the "%s" vault. Specify the item with its UUID, name, or domain.' % (title, vault))
-    with open(path) as handle:
-        return json.load(handle)
+def find(reference):
+    """An item by title, or by id (the real op accepts both)."""
+    path = path_for(reference)
+    if os.path.exists(path):
+        with open(path) as handle:
+            return json.load(handle)
+    for item in load_all():
+        if item["id"] == reference:
+            return item
+    fail('"%s" isn\'t an item in the "%s" vault. Specify the item with its UUID, name, or domain.' % (reference, vault))
 
 
 def counter():
@@ -1934,14 +2104,19 @@ elif command == ["item", "create"] and rest == ["-"]:
 elif command == ["item", "edit"] and rest[1:] == ["-"]:
     item = find(rest[0])
     template = json.loads(sys.stdin.read())
+    # Like the real op: built-in fields (those with a purpose) are updated in
+    # place, while the custom fields are replaced by the template's custom fields.
+    builtin = [field for field in item["fields"] if field.get("purpose")]
+    custom = []
     for incoming in template.get("fields", []):
-        for field in item["fields"]:
-            if incoming.get("id") and field["id"] == incoming["id"]:
-                field.update(incoming)
-                break
+        if incoming.get("purpose"):
+            for field in builtin:
+                if field.get("id") == incoming.get("id"):
+                    field.update(incoming)
         else:
             incoming.setdefault("id", "f%d" % counter())
-            item["fields"].append(incoming)
+            custom.append(incoming)
+    item["fields"] = builtin + custom
     write(item)
     print(json.dumps({"id": item["id"]}))
 elif command == ["item", "delete"]:
@@ -1951,7 +2126,138 @@ else:
     fail("fake op: unsupported command: " + " ".join(args))
 ```
 
-- [ ] **Step 2: Declare the modules in `src/lib.rs`**
+- [ ] **Step 2: Create `tests/fake_op.rs`, which pins the fake's behavior to what the real `op item edit -` does (it replaces the custom fields instead of merging them; observed against a real vault)**
+
+`tests/fake_op.rs`:
+
+```rust
+//! The fake `op` must behave like the real one where the daemon depends on it.
+
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+const FAKE_OP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-op.py");
+
+fn fake(db: &Path, args: &[&str], stdin: Option<&str>) -> String {
+    let mut child = Command::new("python3")
+        .arg(FAKE_OP)
+        .args(args)
+        .env("FAKE_OP_DB", db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if let Some(text) = stdin {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn labels(db: &Path) -> Vec<String> {
+    let item: serde_json::Value =
+        serde_json::from_str(&fake(db, &["item", "get", "t", "--vault", "V"], None)).unwrap();
+    item["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|field| field["label"].as_str().map(str::to_owned))
+        .collect()
+}
+
+const CREATE: &str = r#"{"title":"t","tags":["x"],"fields":[
+    {"id":"password","purpose":"PASSWORD","label":"password","type":"CONCEALED","value":"old"},
+    {"label":"label","type":"STRING","value":"keep me"}]}"#;
+
+#[test]
+fn a_partial_template_edit_drops_the_custom_fields_like_the_real_op() {
+    // Observed against a real vault: `op item edit <item> -` with a template
+    // replaces the custom fields instead of merging them.
+    let dir = tempfile::tempdir().unwrap();
+    fake(
+        dir.path(),
+        &["item", "create", "--vault", "V", "-"],
+        Some(CREATE),
+    );
+    assert!(labels(dir.path()).contains(&"label".to_owned()));
+
+    fake(
+        dir.path(),
+        &["item", "edit", "t", "--vault", "V", "-"],
+        Some(r#"{"fields":[{"id":"password","value":"new"}]}"#),
+    );
+    assert!(
+        !labels(dir.path()).contains(&"label".to_owned()),
+        "a partial edit must lose the custom `label` field"
+    );
+}
+
+#[test]
+fn a_complete_template_edit_keeps_every_field() {
+    let dir = tempfile::tempdir().unwrap();
+    fake(
+        dir.path(),
+        &["item", "create", "--vault", "V", "-"],
+        Some(CREATE),
+    );
+    fake(
+        dir.path(),
+        &["item", "edit", "t", "--vault", "V", "-"],
+        Some(
+            r#"{"fields":[
+            {"id":"password","purpose":"PASSWORD","label":"password","type":"CONCEALED","value":"new"},
+            {"label":"label","type":"STRING","value":"kept"}]}"#,
+        ),
+    );
+    assert!(labels(dir.path()).contains(&"label".to_owned()));
+    let item: serde_json::Value = serde_json::from_str(&fake(
+        dir.path(),
+        &["item", "get", "t", "--vault", "V"],
+        None,
+    ))
+    .unwrap();
+    let password = item["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "password")
+        .unwrap();
+    assert_eq!(password["value"], "new");
+}
+
+#[test]
+fn an_item_can_be_fetched_by_its_id_as_well_as_by_its_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let created: serde_json::Value = serde_json::from_str(&fake(
+        dir.path(),
+        &["item", "create", "--vault", "V", "-"],
+        Some(CREATE),
+    ))
+    .unwrap();
+    let id = created["id"].as_str().unwrap();
+    let by_id: serde_json::Value = serde_json::from_str(&fake(
+        dir.path(),
+        &["item", "get", id, "--vault", "V", "--format", "json"],
+        None,
+    ))
+    .unwrap();
+    assert_eq!(by_id["title"], "t");
+}
+```
+
+- [ ] **Step 3: Declare the modules in `src/lib.rs`**
 
 `src/lib.rs`:
 
@@ -1965,7 +2271,7 @@ pub mod op;
 pub mod store;
 ```
 
-- [ ] **Step 3: Create `src/cache.rs` with only the tests**
+- [ ] **Step 4: Create `src/cache.rs` with only the tests**
 
 `src/cache.rs`:
 
@@ -1983,6 +2289,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         assert!(cell.fresh().is_none());
         assert_eq!(cell.current(), Some(&7));
+    }
+
+    #[test]
+    fn a_fresh_value_can_be_updated_in_place() {
+        let mut cell = TtlCell::new(Duration::from_secs(60));
+        assert!(cell.fresh_mut().is_none());
+        cell.set(vec![1]);
+        cell.fresh_mut().unwrap().push(2);
+        assert_eq!(cell.fresh(), Some(&vec![1, 2]));
+        let mut disabled = TtlCell::new(Duration::ZERO);
+        disabled.set(vec![1]);
+        assert!(disabled.fresh_mut().is_none());
     }
 
     #[test]
@@ -2004,7 +2322,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Create `src/store.rs` with only the tests**
+- [ ] **Step 5: Create `src/store.rs` with only the tests**
 
 `src/store.rs`:
 
@@ -2329,17 +2647,372 @@ mod tests {
         assert!(parse_json_stream(b"").unwrap().is_empty());
         assert!(parse_json_stream(b"{oops").is_err());
     }
+
+    fn reset_calls(dir: &Path) {
+        let _ = std::fs::remove_file(dir.join("db/calls.log"));
+    }
+
+    fn gh_attrs() -> Attributes {
+        attrs(&[("service", "gh:github.com"), ("username", "bob")])
+    }
+
+    /// A vault with some noise and one `gh` item, read through a store that has never loaded anything.
+    async fn vault_with_a_gh_item(dir: &Path) -> (String, Store) {
+        let writer = store_in(dir, |_| {});
+        for n in 0..3 {
+            let noise = attrs(&[("service", "other"), ("n", &n.to_string())]);
+            writer
+                .create(noise, "noise", b"x", "text/plain", false)
+                .await
+                .unwrap();
+        }
+        let key = writer
+            .create(gh_attrs(), "gh", b"tok", "text/plain", false)
+            .await
+            .unwrap()
+            .key;
+        reset_calls(dir);
+        (key, store_in(dir, |_| {}))
+    }
+
+    #[tokio::test]
+    async fn an_exact_search_on_a_cold_store_reads_one_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, cold) = vault_with_a_gh_item(dir.path()).await;
+
+        let found = cold.search(&gh_attrs()).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key, key);
+        let log = calls(dir.path());
+        assert_eq!(
+            count(&log, "item get"),
+            1,
+            "only the exact item is read: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|call| call.starts_with(&format!("item get secret-service/{key}"))),
+            "{log:?}"
+        );
+        assert!(count(&log, "item list") <= 1, "{log:?}");
+
+        assert_eq!(&*cold.secret(&key).await.unwrap().0, b"tok");
+        assert_eq!(
+            calls(dir.path()).len(),
+            log.len(),
+            "the secret needs no further call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_secret_or_info_lookup_by_key_reads_one_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, cold) = vault_with_a_gh_item(dir.path()).await;
+        assert_eq!(cold.info(&key).await.unwrap().attributes, gh_attrs());
+        assert_eq!(&*cold.secret(&key).await.unwrap().0, b"tok");
+        let log = calls(dir.path());
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(matches!(
+            cold.info("0000000000000000").await,
+            Err(Error::NotFound)
+        ));
+        assert_eq!(
+            calls(dir.path()).len(),
+            2,
+            "an unknown key costs one more read, not a scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subset_search_on_a_cold_store_finds_items_with_more_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = store_in(dir.path(), |_| {});
+        let superset = attrs(&[
+            ("service", "gh:github.com"),
+            ("username", "bob"),
+            ("extra", "x"),
+        ]);
+        writer
+            .create(superset.clone(), "gh", b"tok", "text/plain", false)
+            .await
+            .unwrap();
+        reset_calls(dir.path());
+
+        let cold = store_in(dir.path(), |_| {});
+        let found = cold.search(&gh_attrs()).await.unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "a partial query still finds items with more attributes"
+        );
+        assert_eq!(found[0].attributes, superset);
+        let log = calls(dir.path());
+        assert!(
+            log.iter().any(|call| call.starts_with("item list")),
+            "{log:?}"
+        );
+
+        let before = calls(dir.path()).len();
+        cold.search(&gh_attrs()).await.unwrap();
+        assert_eq!(
+            calls(dir.path()).len(),
+            before,
+            "the loaded index answers the repeat"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fast_path_respects_the_allow_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = store_in(dir.path(), |_| {});
+        writer
+            .create(gh_attrs(), "gh", b"tok", "text/plain", false)
+            .await
+            .unwrap();
+        let strict = store_in(dir.path(), |c| c.allow = vec!["service=glab".into()]);
+        assert!(strict.search(&gh_attrs()).await.unwrap().is_empty());
+        let key = item_key(&gh_attrs());
+        assert!(matches!(strict.secret(&key).await, Err(Error::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn writes_on_a_cold_store_do_not_load_the_whole_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cold) = vault_with_a_gh_item(dir.path()).await;
+
+        cold.create(
+            attrs(&[("service", "new")]),
+            "new",
+            b"1",
+            "text/plain",
+            false,
+        )
+        .await
+        .unwrap();
+        let log = calls(dir.path());
+        assert_eq!(log.len(), 2, "one existence check and one create: {log:?}");
+        assert!(log[0].starts_with("item get"), "{log:?}");
+        assert!(log[1].starts_with("item create"), "{log:?}");
+
+        reset_calls(dir.path());
+        cold.create(gh_attrs(), "gh", b"tok2", "text/plain", true)
+            .await
+            .unwrap();
+        let log = calls(dir.path());
+        assert!(
+            log.iter().all(|call| !call.starts_with("item list")),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|call| call.starts_with("item edit")),
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_exact_searches_share_one_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cold) = vault_with_a_gh_item(dir.path()).await;
+        let cold = std::sync::Arc::new(cold);
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..6 {
+            let store = cold.clone();
+            tasks.spawn(async move { store.search(&gh_attrs()).await.unwrap().len() });
+        }
+        while let Some(found) = tasks.join_next().await {
+            assert_eq!(found.unwrap(), 1);
+        }
+        let log = calls(dir.path());
+        assert_eq!(count(&log, "item get"), 1, "one shared read: {log:?}");
+        assert_eq!(count(&log, "item list"), 1, "one shared listing: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn the_index_is_loaded_with_parallel_reads_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = store_in(dir.path(), |_| {});
+        for n in 0..6 {
+            let a = attrs(&[("service", "bulk"), ("n", &n.to_string())]);
+            writer
+                .create(a, "bulk", b"x", "text/plain", false)
+                .await
+                .unwrap();
+        }
+        reset_calls(dir.path());
+        std::fs::write(dir.path().join("db/SLOW"), "0.5").unwrap();
+
+        let cold = store_in(dir.path(), |_| {});
+        let started = std::time::Instant::now();
+        assert_eq!(cold.search(&attrs(&[])).await.unwrap().len(), 6);
+        let elapsed = started.elapsed();
+
+        // Serial reads would need 0.5 s for the list plus 6 x 0.5 s for the items.
+        assert!(elapsed < Duration::from_millis(2400), "took {elapsed:?}");
+        let log = calls(dir.path());
+        assert!(
+            log.iter().all(|call| !call.starts_with("item get -")),
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|call| call.starts_with("item get"))
+                .count(),
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn the_index_never_runs_more_than_four_reads_at_once() {
+        // The 1Password app rejects bursts: eight parallel `op.exe` calls made half of them fail.
+        let dir = tempfile::tempdir().unwrap();
+        let writer = store_in(dir.path(), |_| {});
+        for n in 0..10 {
+            let a = attrs(&[("service", "bulk"), ("n", &n.to_string())]);
+            writer
+                .create(a, "bulk", b"x", "text/plain", false)
+                .await
+                .unwrap();
+        }
+        let _ = std::fs::remove_file(dir.path().join("db/concurrency.log"));
+        std::fs::write(dir.path().join("db/SLOW"), "0.4").unwrap();
+
+        let cold = store_in(dir.path(), |_| {});
+        assert_eq!(cold.search(&attrs(&[])).await.unwrap().len(), 10);
+
+        let peak = std::fs::read_to_string(dir.path().join("db/concurrency.log"))
+            .unwrap()
+            .lines()
+            .map(|line| line.parse::<usize>().unwrap())
+            .max()
+            .unwrap();
+        assert!((2..=4).contains(&peak), "peak concurrency was {peak}");
+    }
+
+    fn count(log: &[String], prefix: &str) -> usize {
+        log.iter().filter(|call| call.starts_with(prefix)).count()
+    }
+
+    #[tokio::test]
+    async fn items_are_tagged_with_their_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path(), |_| {});
+        let a = attrs(&[("service", "gh"), ("username", "")]);
+        let key = store
+            .create(a.clone(), "x", b"1", "text/plain", false)
+            .await
+            .unwrap()
+            .key;
+        let raw = std::fs::read_to_string(
+            dir.path()
+                .join(format!("db/items/secret-service__{key}.json")),
+        )
+        .unwrap();
+        let item: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let tags: Vec<&str> = item["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
+        assert!(tags.contains(&"secret-service"), "{tags:?}");
+        assert!(tags.contains(&attrs_tag(&a).as_str()), "{tags:?}");
+    }
+
+    #[tokio::test]
+    async fn a_subset_search_lists_once_and_reads_only_the_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = store_in(dir.path(), |_| {});
+        for n in 0..5 {
+            let noise = attrs(&[("service", "other"), ("n", &n.to_string())]);
+            writer
+                .create(noise, "noise", b"x", "text/plain", false)
+                .await
+                .unwrap();
+        }
+        let superset = attrs(&[
+            ("application", "py"),
+            ("service", "gh"),
+            ("username", "bob"),
+        ]);
+        writer
+            .create(superset.clone(), "gh", b"tok", "text/plain", false)
+            .await
+            .unwrap();
+        reset_calls(dir.path());
+
+        let cold = store_in(dir.path(), |_| {});
+        let query = attrs(&[("service", "gh"), ("username", "bob")]);
+        let found = cold.search(&query).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].attributes, superset);
+        let log = calls(dir.path());
+        assert_eq!(count(&log, "item list"), 1, "{log:?}");
+        assert_eq!(
+            count(&log, "item get"),
+            2,
+            "the exact try and the one match: {log:?}"
+        );
+        assert_eq!(&*cold.secret(&found[0].key).await.unwrap().0, b"tok");
+        assert_eq!(
+            count(&calls(dir.path()), "item get"),
+            2,
+            "the match is cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_without_matches_costs_one_exact_read_and_one_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cold) = vault_with_a_gh_item(dir.path()).await;
+        let none = attrs(&[("service", "nothing-like-this")]);
+        assert!(cold.search(&none).await.unwrap().is_empty());
+        let log = calls(dir.path());
+        assert_eq!(count(&log, "item list"), 1, "{log:?}");
+        assert_eq!(count(&log, "item get"), 1, "{log:?}");
+        assert!(cold.search(&none).await.unwrap().is_empty());
+        assert_eq!(
+            calls(dir.path()).len(),
+            log.len(),
+            "the repeat is served from memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_hit_does_not_depend_on_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cold) = vault_with_a_gh_item(dir.path()).await;
+        std::fs::write(dir.path().join("db/FAIL_LIST"), "").unwrap();
+        assert_eq!(cold.search(&gh_attrs()).await.unwrap().len(), 1);
+        let other = attrs(&[("service", "nothing-like-this")]);
+        assert!(
+            cold.search(&other).await.is_err(),
+            "a miss must not be answered as empty when the listing failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_attribute_filter_ignores_items_outside_the_allow_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = store_in(dir.path(), |_| {});
+        let hidden = attrs(&[("service", "gh"), ("username", "bob"), ("extra", "x")]);
+        writer
+            .create(hidden, "gh", b"tok", "text/plain", false)
+            .await
+            .unwrap();
+        let strict = store_in(dir.path(), |c| c.allow = vec!["service=glab".into()]);
+        assert!(strict.search(&gh_attrs()).await.unwrap().is_empty());
+    }
 }
 ```
 
-- [ ] **Step 5: Run the tests to see them fail**
+- [ ] **Step 6: Run the tests to see them fail**
 
 ```bash
 cargo test --lib -- cache:: store::
 ```
 Expected: FAIL, compile errors (`TtlCell`, `Store` not found).
 
-- [ ] **Step 6: Write the implementation of `TtlCell`**
+- [ ] **Step 7: Write the implementation of `TtlCell`**
 
 Put this above the `#[cfg(test)]` line of `src/cache.rs`:
 
@@ -2368,6 +3041,16 @@ impl<T> TtlCell<T> {
         }
     }
 
+    /// Mutable access to the value while it is still fresh.
+    pub fn fresh_mut(&mut self) -> Option<&mut T> {
+        match &mut self.value {
+            Some((stored, value)) if !self.ttl.is_zero() && stored.elapsed() < self.ttl => {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
     /// The stored value regardless of its age; used right after `set`.
     pub fn current(&self) -> Option<&T> {
         self.value.as_ref().map(|(_, value)| value)
@@ -2383,7 +3066,7 @@ impl<T> TtlCell<T> {
 }
 ```
 
-- [ ] **Step 7: Write the implementation of `Store`**
+- [ ] **Step 8: Write the implementation of `Store`**
 
 Put this above the `#[cfg(test)]` line of `src/store.rs`. Reads load the whole tagged set with two `op` calls and cache it; writes address an item by its deterministic title and invalidate the cache:
 
@@ -2393,14 +3076,18 @@ Put this above the `#[cfg(test)]` line of `src/store.rs`. Reads load the whole t
 //! with two `op` calls and cache it in memory; writes address items by title.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 use zeroize::Zeroizing;
 
-use crate::attrs::{AllowList, Attributes, TITLE_PREFIX, item_key, item_title, matches};
+use crate::attrs::{
+    AllowList, Attributes, TITLE_PREFIX, attrs_tag, item_key, item_title, matches, parse_attrs_tag,
+};
 use crate::cache::TtlCell;
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -2420,6 +3107,7 @@ pub struct ItemInfo {
     pub attributes: Attributes,
 }
 
+#[derive(Clone)]
 struct Record {
     info: ItemInfo,
     secret: Zeroizing<Vec<u8>>,
@@ -2429,6 +3117,19 @@ struct Record {
 }
 
 type Index = BTreeMap<String, Record>;
+type Singles = HashMap<String, Option<Record>>;
+
+/// One line of `op item list`: enough to filter by attributes without reading the item.
+#[derive(Clone)]
+struct Entry {
+    id: String,
+    key: String,
+    attributes: Option<Attributes>,
+}
+
+/// How many `op item get` processes run at once while the index loads. The
+/// 1Password app rejects bursts: with eight at once about half of the calls failed.
+const PARALLEL_READS: usize = 4;
 
 #[derive(Deserialize)]
 struct RawField {
@@ -2459,6 +3160,16 @@ fn parse_json_stream(bytes: &[u8]) -> Result<Vec<Value>> {
         }
     }
     Ok(out)
+}
+
+/// One item as printed by `op item get`.
+fn parse_item(bytes: &[u8]) -> Result<Option<Record>> {
+    let Some(value) = parse_json_stream(bytes)?.pop() else {
+        return Ok(None);
+    };
+    let raw: RawItem = serde_json::from_value(value)
+        .map_err(|error| Error::OpFailed(format!("unexpected item shape: {error}")))?;
+    Ok(record_from(raw))
 }
 
 fn record_from(raw: RawItem) -> Option<Record> {
@@ -2511,6 +3222,11 @@ fn secret_fields(secret: &[u8]) -> (String, &'static str) {
 }
 
 /// Fields of an item template; `ids` supplies existing field ids when editing.
+///
+/// An edit must always send the complete set: the real `op item edit <item> -`
+/// replaces the custom fields with those of the template instead of merging
+/// them, so a partial template silently drops the rest (observed against a real
+/// vault, and mirrored by the fake `op` used in the tests).
 fn fields_json(
     label: &str,
     attributes: &Attributes,
@@ -2541,61 +3257,176 @@ fn fields_json(
 }
 
 pub struct Store {
-    op: OpRunner,
+    op: Arc<OpRunner>,
     vault: String,
     tag: String,
     allow: AllowList,
+    /// Every item of the tagged set, loaded on demand.
     index: Mutex<TtlCell<Index>>,
+    /// The listing of the tagged set: ids, keys, and attributes taken from the tags.
+    listing: Mutex<TtlCell<Vec<Entry>>>,
+    /// Single items read by key (`None` remembers that the item does not exist).
+    singles: Mutex<TtlCell<Singles>>,
     write_lock: Mutex<()>,
 }
 
 impl Store {
     pub fn new(op: OpRunner, config: &Config) -> Result<Self> {
         Ok(Self {
-            op,
+            op: Arc::new(op),
             vault: config.vault.clone(),
             tag: config.tag.clone(),
             allow: config.allow_list()?,
             index: Mutex::new(TtlCell::new(config.cache_ttl)),
+            listing: Mutex::new(TtlCell::new(config.cache_ttl)),
+            singles: Mutex::new(TtlCell::new(config.cache_ttl)),
             write_lock: Mutex::new(()),
         })
     }
 
-    async fn load_index(&self) -> Result<Index> {
-        let listing = self
-            .op
-            .run(
-                &[
-                    "item",
-                    "list",
-                    "--vault",
-                    &self.vault,
-                    "--tags",
-                    &self.tag,
-                    "--format",
-                    "json",
-                ],
-                None,
-            )
-            .await?;
-        if parse_json_stream(&listing)?.is_empty() {
-            return Ok(Index::new());
+    /// One `op item list` for the tagged set. It is shared by concurrent callers
+    /// and cached; the attributes come from the `attrs:` tag, so no item is read.
+    async fn entries(&self) -> Result<Vec<Entry>> {
+        let mut cell = self.listing.lock().await;
+        if cell.fresh().is_none() {
+            let output = self
+                .op
+                .run(
+                    &[
+                        "item",
+                        "list",
+                        "--vault",
+                        &self.vault,
+                        "--tags",
+                        &self.tag,
+                        "--format",
+                        "json",
+                    ],
+                    None,
+                )
+                .await?;
+            let mut entries = Vec::new();
+            for item in parse_json_stream(&output)? {
+                let (Some(id), Some(title)) = (item["id"].as_str(), item["title"].as_str()) else {
+                    continue;
+                };
+                let Some(key) = title.strip_prefix(TITLE_PREFIX) else {
+                    continue;
+                };
+                let attributes = item["tags"].as_array().and_then(|tags| {
+                    tags.iter()
+                        .filter_map(|tag| tag.as_str())
+                        .find_map(parse_attrs_tag)
+                });
+                entries.push(Entry {
+                    id: id.to_owned(),
+                    key: key.to_owned(),
+                    attributes,
+                });
+            }
+            cell.set(entries);
         }
-        let items = self
-            .op
-            .run(&["item", "get", "-", "--format", "json"], Some(&listing))
-            .await?;
-        let mut index = Index::new();
-        for value in parse_json_stream(&items)? {
-            let raw: RawItem = serde_json::from_value(value)
-                .map_err(|error| Error::OpFailed(format!("unexpected item shape: {error}")))?;
-            if let Some(record) = record_from(raw)
+        Ok(cell.current().expect("the listing was just stored").clone())
+    }
+
+    /// Reads items by id, at most `PARALLEL_READS` at a time. An item deleted
+    /// since the listing is skipped; any other failure aborts the rest.
+    async fn read_items(&self, ids: Vec<String>) -> Result<Vec<Record>> {
+        let limit = Arc::new(Semaphore::new(PARALLEL_READS));
+        let mut tasks = JoinSet::new();
+        for id in ids {
+            let (op, vault, limit) = (self.op.clone(), self.vault.clone(), limit.clone());
+            tasks.spawn(async move {
+                let _permit = limit
+                    .acquire_owned()
+                    .await
+                    .expect("the semaphore stays open");
+                op.run(
+                    &["item", "get", &id, "--vault", &vault, "--format", "json"],
+                    None,
+                )
+                .await
+            });
+        }
+        let mut records = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let output = match joined.map_err(|error| Error::Internal(error.to_string()))? {
+                Ok(output) => output,
+                Err(Error::NotFound) => continue,
+                Err(error) => return Err(error),
+            };
+            if let Some(record) = parse_item(&output)?
                 && self.allow.permits(&record.info.attributes)
             {
-                index.insert(record.info.key.clone(), record);
+                records.push(record);
             }
         }
-        Ok(index)
+        Ok(records)
+    }
+
+    /// Loads the whole tagged set: the listing, then every item.
+    async fn load_index(&self) -> Result<Index> {
+        let ids = self.entries().await?.into_iter().map(|e| e.id).collect();
+        Ok(self
+            .read_items(ids)
+            .await?
+            .into_iter()
+            .map(|record| (record.info.key.clone(), record))
+            .collect())
+    }
+
+    /// Keeps records that were read for a search, so a following `secret` needs no call.
+    async fn remember(&self, records: &[Record]) {
+        let mut singles = self.singles.lock().await;
+        if singles.fresh().is_none() {
+            singles.set(Singles::new());
+        }
+        if let Some(map) = singles.fresh_mut() {
+            for record in records {
+                map.insert(record.info.key.clone(), Some(record.clone()));
+            }
+        }
+    }
+
+    /// A search on a cold store: the item with exactly these attributes, else
+    /// every item whose attributes contain them.
+    async fn search_cold(&self, query: &Attributes) -> Result<Vec<ItemInfo>> {
+        let key = item_key(query);
+        // The exact read and the listing run side by side; the listing only
+        // matters on a miss, and each call costs seconds through Windows.
+        let (exact, entries) = tokio::join!(self.fetch_one(&key), self.entries());
+        if let Some(record) = exact? {
+            return Ok(vec![record.info]);
+        }
+        let candidates: Vec<Entry> = entries?
+            .into_iter()
+            .filter(|entry| {
+                entry.key != key
+                    && entry
+                        .attributes
+                        .as_ref()
+                        .is_some_and(|a| matches(query, a) && self.allow.permits(a))
+            })
+            .collect();
+        // Items read earlier are reused; only the others cost a call.
+        let mut records = Vec::new();
+        let mut missing = Vec::new();
+        {
+            let singles = self.singles.lock().await;
+            for entry in candidates {
+                match singles.fresh().and_then(|map| map.get(&entry.key)) {
+                    Some(Some(record)) => records.push(record.clone()),
+                    _ => missing.push(entry.id),
+                }
+            }
+        }
+        let fetched = self.read_items(missing).await?;
+        self.remember(&fetched).await;
+        records.extend(fetched);
+        records.retain(|record| matches(query, &record.info.attributes));
+        let mut found: Vec<ItemInfo> = records.into_iter().map(|record| record.info).collect();
+        found.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(found)
     }
 
     async fn with_index<T>(&self, f: impl FnOnce(&Index) -> T) -> Result<T> {
@@ -2607,12 +3438,71 @@ impl Store {
         Ok(f(cell.current().expect("index was just stored")))
     }
 
+    fn index_is_fresh(&self) -> bool {
+        self.index
+            .try_lock()
+            .is_ok_and(|cell| cell.fresh().is_some())
+    }
+
+    /// One item by key. The title is derived from the key, so this is a single
+    /// `op item get` instead of a scan of the vault.
+    async fn fetch_one(&self, key: &str) -> Result<Option<Record>> {
+        // A fresh index is authoritative; a busy one must not delay this read.
+        if let Ok(cell) = self.index.try_lock()
+            && let Some(index) = cell.fresh()
+        {
+            return Ok(index.get(key).cloned());
+        }
+        let mut singles = self.singles.lock().await;
+        if let Some(entry) = singles.fresh().and_then(|map| map.get(key)) {
+            return Ok(entry.clone());
+        }
+        let title = format!("{TITLE_PREFIX}{key}");
+        let record = match self
+            .op
+            .run(
+                &[
+                    "item",
+                    "get",
+                    &title,
+                    "--vault",
+                    &self.vault,
+                    "--format",
+                    "json",
+                ],
+                None,
+            )
+            .await
+        {
+            Ok(output) => parse_item(&output)?
+                .filter(|r| r.info.key == key && self.allow.permits(&r.info.attributes)),
+            Err(Error::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        if singles.fresh().is_none() {
+            singles.set(Singles::new());
+        }
+        if let Some(map) = singles.fresh_mut() {
+            map.insert(key.to_owned(), record.clone());
+        }
+        Ok(record)
+    }
+
     async fn invalidate(&self) {
         self.index.lock().await.invalidate();
+        self.listing.lock().await.invalidate();
+        self.singles.lock().await.invalidate();
     }
 
     /// Items whose attributes contain every pair of `query`.
+    ///
+    /// On a cold store a non-empty query costs one exact read and one listing run
+    /// side by side, plus a read of each other match; an empty query loads the
+    /// whole set; a loaded index answers any query from memory.
     pub async fn search(&self, query: &Attributes) -> Result<Vec<ItemInfo>> {
+        if !query.is_empty() && !self.index_is_fresh() {
+            return self.search_cold(query).await;
+        }
         self.with_index(|index| {
             index
                 .values()
@@ -2624,20 +3514,18 @@ impl Store {
     }
 
     pub async fn info(&self, key: &str) -> Result<ItemInfo> {
-        self.with_index(|index| index.get(key).map(|r| r.info.clone()))
+        self.fetch_one(key)
             .await?
+            .map(|record| record.info)
             .ok_or(Error::NotFound)
     }
 
     /// The secret value and its content type.
     pub async fn secret(&self, key: &str) -> Result<(Zeroizing<Vec<u8>>, String)> {
-        self.with_index(|index| {
-            index
-                .get(key)
-                .map(|r| (r.secret.clone(), r.content_type.clone()))
-        })
-        .await?
-        .ok_or(Error::NotFound)
+        self.fetch_one(key)
+            .await?
+            .map(|record| (record.secret, record.content_type))
+            .ok_or(Error::NotFound)
     }
 
     /// Creates an item. An existing item with the same attributes is replaced
@@ -2659,12 +3547,9 @@ impl Store {
         let key = item_key(&attributes);
         let title = item_title(&attributes);
         let existing = self
-            .with_index(|index| {
-                index
-                    .get(&key)
-                    .map(|r| (r.info.clone(), r.field_ids.clone()))
-            })
-            .await?;
+            .fetch_one(&key)
+            .await?
+            .map(|record| (record.info, record.field_ids));
         let info = ItemInfo {
             key,
             label: label.to_owned(),
@@ -2692,7 +3577,7 @@ impl Store {
                     serde_json::to_vec(&json!({
                         "title": title,
                         "category": "PASSWORD",
-                        "tags": [self.tag],
+                        "tags": [self.tag, attrs_tag(&attributes)],
                         "fields": fields,
                     }))
                     .map_err(|e| Error::Internal(e.to_string()))?,
@@ -2740,24 +3625,31 @@ impl Store {
 }
 ```
 
-- [ ] **Step 8: Run the tests to see them pass**
+- [ ] **Step 9: Run the tests to see them pass**
 
 ```bash
 cargo test --lib
 ```
-Expected: PASS, 53 tests in total at this point.
+Expected: PASS, 74 tests in total at this point.
 
-- [ ] **Step 9: Check formatting and lints**
+- [ ] **Step 10: Run the fixture tests**
+
+```bash
+cargo test --test fake_op
+```
+Expected: PASS, 3 tests (they check the fixture itself, so they pass on the first run).
+
+- [ ] **Step 11: Check formatting and lints**
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
 ```
 Expected: no output.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
-git add tests/fixtures/fake-op.py src/cache.rs src/store.rs src/lib.rs
+git add tests/fixtures/fake-op.py tests/fake_op.rs src/cache.rs src/store.rs src/lib.rs
 git commit -m "feat(store): keep secrets as 1Password items with an in-memory index"
 ```
 
@@ -2768,7 +3660,7 @@ git commit -m "feat(store): keep secrets as 1Password items with an in-memory in
 - Create: `tests/common/mod.rs`, `tests/protocol.rs`, `src/dbus/mod.rs`, `src/dbus/session.rs`, `src/dbus/item.rs`, `src/dbus/collection.rs`, `src/dbus/service.rs`, `src/lifecycle.rs`
 - Modify: `src/lib.rs`, `src/main.rs`
 
-Exports the Secret Service objects with `zbus`, claims the bus name, exits when idle, and wires `op-secretd serve`. The integration harness starts a private `dbus-daemon` and the real binary against the fake `op`; the protocol tests talk to it with a Rust client that implements both session algorithms. Four details were established empirically and are pinned by tests: `GetSecret` must reply with one `(oayays)` structure (go-keyring rejects the flattened form); a property getter must not export objects (`zbus` holds the object tree and `ObjectServer::at` would deadlock), so items are exported by methods and once in the background at startup; a taken bus name arrives as `zbus::Error::NameTaken`; and a request in flight keeps the daemon from idling out.
+Exports the Secret Service objects with `zbus`, claims the bus name, exits when idle, and wires `op-secretd serve`. The integration harness starts a private `dbus-daemon` and the real binary against the fake `op`; the protocol tests talk to it with a Rust client that implements both session algorithms. Four details were established empirically and are pinned by tests: `GetSecret` must reply with one `(oayays)` structure (go-keyring rejects the flattened form); a property getter must not export objects (`zbus` holds the object tree and `ObjectServer::at` would deadlock), so items are exported by methods (nothing scans the vault at startup); a taken bus name arrives as `zbus::Error::NameTaken`; and a request in flight keeps the daemon from idling out.
 
 **Interfaces:**
 - Consumes: `Store`, `OpRunner`, `Probe`, `crypto::{negotiate, SessionCipher}`, `config::{load, default_path}`, `tests/fixtures/fake-op.py`.
@@ -3450,9 +4342,17 @@ async fn the_cache_is_shared_between_requests() {
         .lines()
         .filter(|line| line.starts_with("item list"))
         .count();
-    assert_eq!(
-        lists, 2,
-        "one load for the create check, one after the write; reads hit the cache:\n{log}"
+    let reads = log
+        .lines()
+        .filter(|line| line.starts_with("item get secret-service/"))
+        .count();
+    assert!(
+        lists <= 1,
+        "the listing is shared and cached, never repeated:\n{log}"
+    );
+    assert!(
+        reads <= 2,
+        "repeated reads of one item hit the cache after at most the existence check and one read:\n{log}"
     );
 }
 
@@ -3468,6 +4368,11 @@ async fn a_second_provider_cannot_take_the_name() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("already owned"), "{stderr}");
+    assert!(
+        !stderr.contains("internal error"),
+        "a taken name is not an internal error: {stderr}"
+    );
+    assert!(stderr.contains("stop that provider first"), "{stderr}");
 }
 
 #[tokio::test]
@@ -3505,6 +4410,14 @@ async fn concurrent_requests_share_one_index_load() {
     assert_eq!(
         lists, 1,
         "the startup load serves every concurrent search:\n{log}"
+    );
+    let reads = log
+        .lines()
+        .filter(|line| line.starts_with("item get secret-service/"))
+        .count();
+    assert!(
+        reads <= 1,
+        "concurrent identical searches share one read:\n{log}"
     );
 }
 
@@ -3561,6 +4474,18 @@ async fn idle_exit_waits_for_a_request_in_flight() {
         Some(true)
     );
 }
+
+#[tokio::test]
+async fn starting_the_daemon_does_not_scan_the_vault() {
+    let harness = harness().await;
+    // Give a would-be background scan time to start before looking at the log.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let log = std::fs::read_to_string(harness.db().join("calls.log")).unwrap_or_default();
+    assert!(
+        log.lines().all(|line| !line.starts_with("item ")),
+        "a started daemon must not touch 1Password until a client asks:\n{log}"
+    );
+}
 ```
 
 - [ ] **Step 3: Run the tests to see them fail**
@@ -3593,7 +4518,6 @@ use zbus::Connection;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Type};
 use zeroize::Zeroizing;
 
-use crate::attrs::Attributes;
 use crate::crypto::SessionCipher;
 use crate::error::{Error, Result};
 use crate::store::{ItemInfo, Store};
@@ -3770,16 +4694,6 @@ pub async fn export_items(
         paths.push(path);
     }
     Ok(paths)
-}
-
-/// Exports every stored item once, so that `Collection.Items` is complete.
-///
-/// A property getter must not export objects itself: zbus holds the object
-/// tree while a getter runs and `ObjectServer::at` would deadlock.
-pub async fn preload(connection: &Connection, state: &Arc<State>) -> Result<()> {
-    let all = state.store.search(&Attributes::new()).await?;
-    export_items(connection, state, &all).await?;
-    Ok(())
 }
 
 /// Exports the service and collection objects on `builder`.
@@ -4005,7 +4919,9 @@ impl Collection {
         Err(Error::NotSupported("the login collection cannot be deleted".into()).into())
     }
 
-    /// Items that already have an object; see `preload` for why this never exports.
+    /// Items that already have an object. A getter must not export objects (the
+    /// D-Bus library holds its object tree while a getter runs), so items appear
+    /// here after `SearchItems`, `CreateItem`, or another method has exported them.
     #[zbus(property)]
     async fn items(&self) -> Vec<OwnedObjectPath> {
         let _busy = self.state.begin();
@@ -4208,7 +5124,7 @@ use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
 use zbus::names::BusName;
 
 use crate::config::Config;
-use crate::dbus::{State, preload, serve_objects};
+use crate::dbus::{State, serve_objects};
 use crate::error::{Error, Result};
 use crate::op::{OpRunner, Probe};
 use crate::store::Store;
@@ -4216,7 +5132,7 @@ use crate::store::Store;
 pub const BUS_NAME: &str = "org.freedesktop.secrets";
 
 fn bus_error(error: impl std::fmt::Display) -> Error {
-    Error::Internal(format!("D-Bus: {error}"))
+    Error::Bus(error.to_string())
 }
 
 /// Best-effort description of the process that owns `BUS_NAME`.
@@ -4238,7 +5154,7 @@ pub async fn describe_owner(connection: &Connection) -> String {
 
 async fn claim_name(connection: &Connection) -> Result<()> {
     let owned_elsewhere = |owner: String| {
-        Error::Internal(format!(
+        Error::NameTaken(format!(
             "{BUS_NAME} is already owned by {owner}; stop that provider first"
         ))
     };
@@ -4297,12 +5213,6 @@ pub async fn serve(config: Config, probe: Probe) -> Result<()> {
         .map_err(bus_error)?;
     claim_name(&connection).await?;
     tracing::info!("serving {BUS_NAME}");
-    let (preload_connection, preload_state) = (connection.clone(), state.clone());
-    tokio::spawn(async move {
-        if let Err(error) = preload(&preload_connection, &preload_state).await {
-            tracing::warn!(%error, "could not list the existing items yet");
-        }
-    });
     wait_for_exit(&state, config.idle_timeout).await
 }
 ```
@@ -4398,7 +5308,7 @@ async fn main() -> ExitCode {
 ```bash
 cargo test
 ```
-Expected: PASS: 53 library tests and 14 protocol tests.
+Expected: PASS: 74 library tests, 3 fixture tests, and 15 protocol tests.
 
 - [ ] **Step 13: Check formatting and lints**
 
@@ -4421,11 +5331,11 @@ git commit -m "feat(dbus): serve the Secret Service API on the session bus"
 - Create: `tests/cli.rs`, `src/doctor.rs`
 - Modify: `src/lib.rs`, `src/main.rs`
 
-Adds `op-secretd doctor` (configuration, `op` resolution, vault access, bus name, session algorithms; exit code 0 only when every check passes) and `op-secretd config init [--force]`.
+Adds `op-secretd doctor` (configuration, `op` resolution, vault access, bus name, session algorithms, and a warning about plaintext `gh` and `glab` tokens; exit code 0 unless a check fails, a warning does not fail it) and `op-secretd config init [--force]`. The plaintext check exists because the real `gh` and `glab` silently store the token in their configuration file when the keyring write fails, so a successful login does not prove the token is in 1Password; it reports file paths only and never a value.
 
 **Interfaces:**
-- Consumes: `OpRunner`, `Config`, `lifecycle::{BUS_NAME, describe_owner}`, `crypto::{DhKeypair, negotiate}`, `Harness`.
-- Produces: `doctor::{Check, run(&Config, &Probe) -> Vec<Check>}`; the `doctor` and `config init` commands.
+- Consumes: `OpRunner`, `Config`, `Probe` (its `env` map), `lifecycle::{BUS_NAME, describe_owner}`, `crypto::{DhKeypair, negotiate}`, `Harness`.
+- Produces: `doctor::{Status::{Ok, Warn, Fail}, Check { name, status, detail }, plaintext_token_check(&HashMap<String, String>) -> Check, run(&Config, &Probe) -> Vec<Check>}`; the `doctor` and `config init` commands.
 
 - [ ] **Step 1: Create `tests/cli.rs`**
 
@@ -4492,6 +5402,7 @@ fn doctor_passes_with_a_working_setup() {
         "vault access",
         "session bus",
         "session algorithms",
+        "plaintext tokens",
     ] {
         assert!(
             stdout.contains(&format!("ok    {check}")),
@@ -4550,6 +5461,36 @@ async fn doctor_recognizes_a_running_daemon() {
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("is served by op-secretd"), "{stdout}");
 }
+
+#[test]
+fn doctor_warns_about_plaintext_tokens_but_still_passes() {
+    let harness = Harness::new();
+    let gh = harness.path("gh-config");
+    std::fs::create_dir_all(&gh).unwrap();
+    std::fs::write(
+        gh.join("hosts.yml"),
+        "github.com:\n    oauth_token: gho_plainsecret123456789\n    user: bob\n",
+    )
+    .unwrap();
+    let config = harness.write_config(&[]);
+    let output = harness
+        .daemon_command(&config)
+        .arg("doctor")
+        .env("GH_CONFIG_DIR", &gh)
+        .output()
+        .unwrap();
+    let stdout = text(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a warning must not fail doctor:\n{stdout}"
+    );
+    assert!(stdout.contains("warn  plaintext tokens"), "{stdout}");
+    assert!(stdout.contains("hosts.yml"), "{stdout}");
+    assert!(
+        !stdout.contains("gho_plainsecret123456789"),
+        "the token leaked:\n{stdout}"
+    );
+}
 ```
 
 - [ ] **Step 2: Run the tests to see them fail**
@@ -4559,12 +5500,157 @@ cargo test --test cli
 ```
 Expected: FAIL: the binary has no `doctor` or `config` command yet.
 
-- [ ] **Step 3: Create `src/doctor.rs`**
+- [ ] **Step 3: Declare the module in `src/lib.rs`**
+
+`src/lib.rs`:
+
+```rust
+pub mod attrs;
+pub mod cache;
+pub mod config;
+pub mod crypto;
+pub mod dbus;
+pub mod doctor;
+pub mod error;
+pub mod lifecycle;
+pub mod op;
+pub mod store;
+```
+
+- [ ] **Step 4: Create `src/doctor.rs` with only the unit tests of the plaintext token check**
 
 `src/doctor.rs`:
 
 ```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+
+    const SECRET: &str = "gho_plainsecret123456789";
+
+    fn env(pairs: &[(&str, &Path)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, path)| ((*key).to_owned(), path.display().to_string()))
+            .collect()
+    }
+
+    fn write(dir: &Path, name: &str, text: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn no_config_files_means_no_plaintext_tokens() {
+        let home = tempfile::tempdir().unwrap();
+        let check = plaintext_token_check(&env(&[("HOME", home.path())]));
+        assert_eq!(check.status, Status::Ok);
+        assert_eq!(check.name, "plaintext tokens");
+    }
+
+    #[test]
+    fn a_gh_token_in_hosts_yml_is_reported_without_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "hosts.yml",
+            &format!(
+                "github.com:\n    users:\n        bob:\n            oauth_token: {SECRET}\n    oauth_token: {SECRET}\n    user: bob\n"
+            ),
+        );
+        let check = plaintext_token_check(&env(&[("GH_CONFIG_DIR", dir.path())]));
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("hosts.yml"), "{}", check.detail);
+        assert!(
+            !check.detail.contains(SECRET),
+            "the value must never be printed"
+        );
+    }
+
+    #[test]
+    fn gh_in_keyring_mode_has_no_oauth_token_line() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "hosts.yml",
+            "github.com:\n    git_protocol: https\n    users:\n        bob:\n    user: bob\n",
+        );
+        let check = plaintext_token_check(&env(&[("GH_CONFIG_DIR", dir.path())]));
+        assert_eq!(check.status, Status::Ok, "{}", check.detail);
+    }
+
+    #[test]
+    fn glab_plaintext_tokens_are_reported_without_their_values() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.yml",
+            &format!(
+                "hosts:\n    gitlab.com:\n        token: {SECRET}\n        oauth2_refresh_token: {SECRET}\n        user: bob\n"
+            ),
+        );
+        let check = plaintext_token_check(&env(&[("GLAB_CONFIG_DIR", dir.path())]));
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("config.yml"), "{}", check.detail);
+        assert!(!check.detail.contains(SECRET));
+    }
+
+    #[test]
+    fn glab_with_empty_or_commented_token_fields_is_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.yml",
+            "hosts:\n    gitlab.com:\n        # Your GitLab access token. token: not-a-value\n        token:\n        job_token: ''\n        oauth2_refresh_token: \"\"\n        use_keyring: true\n",
+        );
+        let check = plaintext_token_check(&env(&[("GLAB_CONFIG_DIR", dir.path())]));
+        assert_eq!(check.status, Status::Ok, "{}", check.detail);
+    }
+
+    #[test]
+    fn xdg_config_home_is_searched_when_no_override_is_set() {
+        let xdg = tempfile::tempdir().unwrap();
+        write(
+            &xdg.path().join("gh"),
+            "hosts.yml",
+            &format!("github.com:\n    oauth_token: {SECRET}\n"),
+        );
+        let check = plaintext_token_check(&env(&[("XDG_CONFIG_HOME", xdg.path())]));
+        assert_eq!(check.status, Status::Warn);
+        write(
+            &xdg.path().join("glab-cli"),
+            "config.yml",
+            &format!("hosts:\n    x:\n        token: {SECRET}\n"),
+        );
+        let both = plaintext_token_check(&env(&[("XDG_CONFIG_HOME", xdg.path())]));
+        assert!(
+            both.detail.contains("hosts.yml") && both.detail.contains("config.yml"),
+            "{}",
+            both.detail
+        );
+    }
+}
+```
+
+- [ ] **Step 5: Run the tests to see them fail**
+
+```bash
+cargo test --lib doctor::
+```
+Expected: FAIL, compile errors (`plaintext_token_check` and `Status` do not exist yet).
+
+- [ ] **Step 6: Write the implementation of `doctor`**
+
+Put this above the `#[cfg(test)]` line of `src/doctor.rs`:
+
+```rust
 //! `op-secretd doctor`: checks that the daemon can run with this setup.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use zbus::fdo::DBusProxy;
 use zbus::names::BusName;
@@ -4574,9 +5660,17 @@ use crate::crypto::{ALGORITHM_DH, DhKeypair, negotiate};
 use crate::lifecycle::{BUS_NAME, describe_owner};
 use crate::op::{OpRunner, Probe};
 
+/// Outcome of one check. A warning is reported but does not fail `doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Ok,
+    Warn,
+    Fail,
+}
+
 pub struct Check {
     pub name: &'static str,
-    pub ok: bool,
+    pub status: Status,
     pub detail: String,
 }
 
@@ -4584,14 +5678,89 @@ fn check(name: &'static str, result: std::result::Result<String, String>) -> Che
     match result {
         Ok(detail) => Check {
             name,
-            ok: true,
+            status: Status::Ok,
             detail,
         },
         Err(detail) => Check {
             name,
-            ok: false,
+            status: Status::Fail,
             detail,
         },
+    }
+}
+
+/// True when a `key: value` line sets one of `keys` to a non-empty value.
+fn sets_secret(line: &str, keys: &[&str]) -> bool {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return false;
+    }
+    let Some((key, value)) = line.split_once(':') else {
+        return false;
+    };
+    let value = value.trim();
+    keys.contains(&key.trim()) && !matches!(value, "" | "''" | "\"\"" | "null" | "~" | "!!null")
+}
+
+fn config_dir(
+    env: &HashMap<String, String>,
+    override_var: &str,
+    xdg_name: &str,
+) -> Option<PathBuf> {
+    if let Some(dir) = env.get(override_var).filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(xdg) = env.get("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(xdg).join(xdg_name));
+    }
+    env.get("HOME")
+        .map(|home| PathBuf::from(home).join(".config").join(xdg_name))
+}
+
+/// Warns about GitHub and GitLab CLI tokens kept in plaintext configuration files.
+///
+/// `gh` and `glab` silently fall back to those files when the keyring cannot be
+/// written, so a successful login does not prove the token is in 1Password. Only
+/// file paths are reported, never values.
+pub fn plaintext_token_check(env: &HashMap<String, String>) -> Check {
+    let targets = [
+        (
+            config_dir(env, "GH_CONFIG_DIR", "gh"),
+            "hosts.yml",
+            &["oauth_token"][..],
+        ),
+        (
+            config_dir(env, "GLAB_CONFIG_DIR", "glab-cli"),
+            "config.yml",
+            &["token", "oauth2_refresh_token"][..],
+        ),
+    ];
+    let mut found = Vec::new();
+    for (dir, file, keys) in targets {
+        let Some(path) = dir.map(|dir| dir.join(file)) else {
+            continue;
+        };
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && text.lines().any(|line| sets_secret(line, keys))
+        {
+            found.push(path.display().to_string());
+        }
+    }
+    if found.is_empty() {
+        return Check {
+            name: "plaintext tokens",
+            status: Status::Ok,
+            detail: "no GitHub or GitLab CLI tokens in plaintext configuration".into(),
+        };
+    }
+    Check {
+        name: "plaintext tokens",
+        status: Status::Warn,
+        detail: format!(
+            "{} hold a token in plaintext; gh and glab fall back to it silently when the keyring fails. \
+             With the daemon healthy, log out and log in again to move it into 1Password",
+            found.join(", ")
+        ),
     }
 }
 
@@ -4649,28 +5818,12 @@ pub async fn run(config: &Config, probe: &Probe) -> Vec<Check> {
     }
     checks.push(check("session bus", session_bus_check().await));
     checks.push(check("session algorithms", algorithms_check()));
+    checks.push(plaintext_token_check(&probe.env));
     checks
 }
 ```
 
-- [ ] **Step 4: Declare the module in `src/lib.rs`**
-
-`src/lib.rs`:
-
-```rust
-pub mod attrs;
-pub mod cache;
-pub mod config;
-pub mod crypto;
-pub mod dbus;
-pub mod doctor;
-pub mod error;
-pub mod lifecycle;
-pub mod op;
-pub mod store;
-```
-
-- [ ] **Step 5: Replace `src/main.rs` with the full command line**
+- [ ] **Step 7: Replace `src/main.rs` with the full command line**
 
 `src/main.rs`:
 
@@ -4680,6 +5833,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use op_secretd::config;
+use op_secretd::doctor::Status;
 use op_secretd::error::{Error, Result};
 use op_secretd::op::Probe;
 use op_secretd::{doctor, lifecycle};
@@ -4779,14 +5933,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             };
             let checks = doctor::run(&config, &Probe::real()).await;
             for check in &checks {
-                println!(
-                    "{}  {}: {}",
-                    if check.ok { "ok  " } else { "FAIL" },
-                    check.name,
-                    check.detail
-                );
+                let label = match check.status {
+                    Status::Ok => "ok  ",
+                    Status::Warn => "warn",
+                    Status::Fail => "FAIL",
+                };
+                println!("{label}  {}: {}", check.name, check.detail);
             }
-            Ok(if checks.iter().all(|check| check.ok) {
+            Ok(if checks.iter().all(|check| check.status != Status::Fail) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
@@ -4807,21 +5961,21 @@ async fn main() -> ExitCode {
 }
 ```
 
-- [ ] **Step 6: Run all tests**
+- [ ] **Step 8: Run all tests**
 
 ```bash
 cargo test
 ```
-Expected: PASS: 53 library, 6 CLI, and 14 protocol tests.
+Expected: PASS: 80 library tests (74 plus 6 for `doctor`), 3 fixture tests, 7 CLI tests, and 15 protocol tests.
 
-- [ ] **Step 7: Check formatting and lints**
+- [ ] **Step 9: Check formatting and lints**
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
 ```
 Expected: no output.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add src tests/cli.rs
@@ -4834,7 +5988,7 @@ git commit -m "feat(cli): add doctor and config init"
 **Files:**
 - Create: `tests/clients.rs`, `tests/fixtures/go-keyring/main.go`, `tests/fixtures/go-keyring/go.mod`, `tests/fixtures/go-keyring/go.sum`
 
-Runs real clients against the daemon: the Go `go-keyring` library (the keyring layer of the GitHub and GitLab CLIs), Python's `keyring` with SecretStorage (which negotiates the DH session), and `secret-tool`. A missing client skips its test unless `OP_SECRETD_REQUIRE_CLIENTS` is set. These tests are compatibility checks for code that already exists, so they are expected to pass on the first run; a failure points at a protocol deviation.
+Runs real clients against the daemon: the Go `go-keyring` library (the keyring layer of the GitHub and GitLab CLIs), Python's `keyring` with SecretStorage (which negotiates the DH session), and `secret-tool`. A missing client, or a tool that is only a version-manager shim, skips its test unless `OP_SECRETD_REQUIRE_CLIENTS` is set. These tests are compatibility checks for code that already exists, so they are expected to pass on the first run; a failure points at a protocol deviation.
 
 **Interfaces:**
 - Consumes: `Harness`, the daemon binary.
@@ -4943,11 +6097,36 @@ assert kr.get_password("gh:github.com", "bob") is None
 print("delete ok")
 "#;
 
-fn available(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .is_ok_and(|output| output.status.success())
+/// True when `program args` succeeds and prints `expected`. Checking the output
+/// rejects version-manager shims that answer every invocation with their own banner.
+fn available(program: &str, args: &[&str], expected: &str) -> bool {
+    for _ in 0..10 {
+        match Command::new(program).args(args).output() {
+            // A script that was written a moment ago can still be busy (ETXTBSY).
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => return false,
+            Ok(output) => {
+                return output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(expected);
+            }
+        }
+    }
+    false
+}
+
+/// True when `program` can be started at all, whatever its exit status.
+fn installed(program: &str) -> bool {
+    for _ in 0..10 {
+        match Command::new(program).arg("--version").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            result => return result.is_ok(),
+        }
+    }
+    false
 }
 
 /// True when the client can run; panics instead of skipping when clients are required.
@@ -4971,10 +6150,39 @@ fn expect_success(what: &str, output: &Output) {
     );
 }
 
+#[test]
+fn a_tool_that_exits_non_zero_without_arguments_is_still_installed() {
+    // `secret-tool --version` prints its usage and exits with status 2.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = dir.path().join("usage-only");
+    std::fs::write(&tool, "#!/bin/sh\necho 'usage: tool store' >&2\nexit 2\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(installed(tool.to_str().unwrap()));
+    assert!(!installed("/nonexistent/definitely-not-a-tool"));
+}
+
+#[test]
+fn a_shim_that_ignores_its_arguments_is_not_a_client() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let write_tool = |name: &str, output: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho '{output}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    };
+    // A version-manager shim answers every invocation with its own banner.
+    let shim = write_tool("go-shim", "mise 2026.9.1 linux-x64");
+    let real = write_tool("go-real", "go version go1.26 linux/amd64");
+    assert!(!available(&shim, &["version"], "go version"));
+    assert!(available(&real, &["version"], "go version"));
+}
+
 #[tokio::test]
 async fn go_keyring_roundtrip() {
     // zalando/go-keyring is the library behind the GitHub and GitLab CLIs.
-    if !client_available("go", available("go", &["version"])) {
+    if !client_available("go", available("go", &["version"], "go version")) {
         return;
     }
     let mut harness = Harness::new();
@@ -5004,7 +6212,11 @@ async fn python_keyring_roundtrip() {
     let python = std::env::var("OP_SECRETD_TEST_PYTHON").unwrap_or_else(|_| "python3".into());
     if !client_available(
         "python keyring",
-        available(&python, &["-c", "import keyring, secretstorage"]),
+        available(
+            &python,
+            &["-c", "import keyring, secretstorage; print(\"ok\")"],
+            "ok",
+        ),
     ) {
         return;
     }
@@ -5021,7 +6233,7 @@ async fn python_keyring_roundtrip() {
 
 #[tokio::test]
 async fn secret_tool_roundtrip() {
-    if !client_available("secret-tool", available("secret-tool", &["--version"])) {
+    if !client_available("secret-tool", installed("secret-tool")) {
         return;
     }
     let mut harness = Harness::new();
@@ -5070,7 +6282,7 @@ async fn secret_tool_roundtrip() {
 ```bash
 cargo test --test clients
 ```
-Expected: PASS (three tests; tests whose client is not installed print `SKIPPED` and pass).
+Expected: PASS (five tests: two check that tools are detected correctly, since a version-manager shim is not a client and a tool that exits non-zero is still installed; three run real clients, and a client that is not installed prints `SKIPPED` and its test passes).
 
 - [ ] **Step 6: Check formatting and lints**
 
@@ -5664,7 +6876,8 @@ command line tool:
 - **Service account:** a service account token can be used instead of the app.
 
 Every secret is one Password item in a dedicated vault, titled
-`secret-service/<hash of its attributes>` and tagged `secret-service`. Items are
+`secret-service/<hash of its attributes>` and tagged `secret-service` plus a tag that
+records its attributes, so a search needs one listing instead of reading every item. Items are
 cached in memory for `cache_ttl`; nothing is written to disk. The daemon starts
 on demand and exits after `idle_timeout` without requests.
 
@@ -5714,7 +6927,7 @@ client asks for the keyring.
 | `mode` | `auto` | `auto`, `app` or `service-account`. |
 | `tag` | `secret-service` | Tag put on every item. |
 | `cache_ttl` | `5m` | In-memory cache lifetime; `0` disables it. |
-| `idle_timeout` | `15m` | Exit after this long without requests; `0` disables it. |
+| `idle_timeout` | `1h` | Exit after this long without requests; `0` disables it. |
 | `allow` | empty | Attribute patterns (`key=glob`); empty accepts everything. |
 | `log_level` | `info` | `error`, `warn`, `info`, `debug` or `trace`. |
 | `[op] binary` | `auto` | Path of `op` or `op.exe`. |
@@ -5736,7 +6949,35 @@ secret-tool store --label=demo service demo username me
 ```
 
 `op-secretd doctor` checks the configuration, access to the vault, the session
-bus and the supported session algorithms.
+bus, the supported session algorithms, and whether `gh` or `glab` keep a token in
+a plaintext configuration file.
+
+**Log in only while `op-secretd doctor` is green.** When the keyring cannot be
+written (the daemon is not running, 1Password is unreachable, or an approval was
+declined), `gh` and `glab` silently store the token in their plaintext
+configuration file instead. `gh` offers `--insecure-storage` but no switch that
+forbids the fallback, so the daemon cannot prevent it. After logging in, make sure
+`doctor` reports no plaintext tokens; if it does, run `gh auth logout` and
+`gh auth login` again while the daemon is healthy.
+
+## Troubleshooting
+
+- **The first request after the daemon starts takes several seconds:** every call to
+  the 1Password CLI goes through the app (and through Windows in WSL) and can take
+  seconds. Results are then cached for `cache_ttl`, and the daemon stays up for
+  `idle_timeout`, so later requests are instant.
+- **A client fails with `authorization prompt dismissed`:** the approval prompt in
+  the 1Password app was closed or the app was locked and not unlocked. Retry the
+  command and approve the prompt.
+- **A client hangs for about two minutes right after the daemon failed to start:**
+  D-Bus waits for its activation timeout after a failed start. Fix the cause
+  (`op-secretd doctor` names it), then start the unit once with
+  `systemctl --user start op-secretd.service`.
+- **The daemon reports that the configuration is missing:** the packaged systemd
+  unit uses a private `/tmp`, so keep the configuration in
+  `$XDG_CONFIG_HOME/op-secretd/` rather than under `/tmp`.
+- **`org.freedesktop.secrets is already owned by ...`:** another Secret Service
+  provider (gnome-keyring, KeePassXC) is running; stop it first.
 
 ## Security notes
 
@@ -5841,7 +7082,10 @@ the store, or the release workflow. Use a throwaway vault.
   `gh api user` work afterwards; the plaintext `hosts.yml` has no token.
 - [ ] `gh auth logout` removes the item (it moves to the archive).
 - [ ] With the daemon unable to reach 1Password (for example the vault renamed),
-  `gh` reports an error and does **not** fall back to a plaintext token file.
+  `gh auth login` falls back to a plaintext token file without any warning (known
+  `gh` behavior); `op-secretd doctor` then reports `warn  plaintext tokens`, and
+  after `gh auth logout` and a login with a healthy daemon the warning is gone.
+  Use an isolated `GH_CONFIG_DIR` and a token you can revoke.
 - [ ] `glab auth login --use-keyring` with a personal access token works and
   survives a day without re-authentication.
 - [ ] `git` with `gh auth git-credential` and `glab auth git-credential`

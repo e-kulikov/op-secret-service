@@ -1,0 +1,166 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag to build and publish again (recovery)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release PR and draft release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ inputs.tag || steps.rp.outputs.tag_name }}
+      publish: ${{ inputs.tag != '' || steps.rp.outputs.release_created == 'true' }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  verify:
+    name: Verify the release
+    needs: release-please
+    if: needs.release-please.outputs.publish == 'true'
+    uses: ./.github/workflows/verify.yml
+    permissions:
+      contents: read
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [release-please, verify]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    env:
+      CARGO_TERM_COLOR: always
+      TAG: ${{ needs.release-please.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+          persist-credentials: false
+
+      - name: Validate the tag against the crate version
+        id: version
+        run: echo "version=$(scripts/validate-release-version.sh "$TAG" Cargo.toml)" >>"$GITHUB_OUTPUT"
+
+      - name: Install build prerequisites
+        run: sudo apt-get install --yes --no-install-recommends musl-tools
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --target "${{ matrix.target }}"
+          rustup default "$channel"
+
+      - name: Build a static binary
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}"
+          binary="target/${{ matrix.target }}/release/op-secretd"
+          file "$binary"
+          if readelf -l "$binary" | grep -Fq INTERP; then
+            echo "the binary has a dynamic interpreter" >&2
+            exit 1
+          fi
+          if readelf -d "$binary" | grep -Fq NEEDED; then
+            echo "the binary has a dynamic dependency" >&2
+            exit 1
+          fi
+          "$binary" --version | grep -Fx "op-secretd ${{ steps.version.outputs.version }}"
+
+      - name: Package
+        run: |
+          scripts/package-release.sh \
+            "${{ steps.version.outputs.version }}" "${{ matrix.target }}" \
+            "target/${{ matrix.target }}/release/op-secretd" dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [release-please, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+      TAG: ${{ needs.release-please.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum ./*.tar.gz | sed 's# \./# #' >SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+      - name: Upload the assets to the draft release
+        run: gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+
+      - name: Verify the uploaded assets
+        run: |
+          mkdir verify
+          gh release download "$TAG" --dir verify
+          (cd verify && sha256sum --check SHA256SUMS)
+          archives=(verify/*.tar.gz)
+          test "${#archives[@]}" -eq 2
+
+      - name: Publish the release
+        run: gh release edit "$TAG" --draft=false --latest
+
+      - name: Fast-forward stable
+        run: |
+          sha=$(git rev-list -n1 "$TAG")
+          git fetch origin stable || true
+          if git rev-parse --verify --quiet origin/stable >/dev/null &&
+            ! git merge-base --is-ancestor origin/stable "$sha"; then
+            echo "stable is not an ancestor of $TAG; refusing to move it" >&2
+            exit 1
+          fi
+          git push origin "$sha:refs/heads/stable"

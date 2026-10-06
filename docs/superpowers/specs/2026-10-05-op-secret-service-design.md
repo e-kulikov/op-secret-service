@@ -84,11 +84,11 @@ The implementation covers the minimum needed by the target clients:
 - `GetSecret` replies with a single `(oayays)` structure; clients such as
   go-keyring reject a reply whose structure is flattened into four arguments.
 - `Created` and `Modified` are always `0`. `Collection.Items` lists the items
-  that currently have an object. Objects are exported by `SearchItems`,
-  `CreateItem`, and once in the background right after the daemon claims the bus
-  name; a property getter never exports objects because the D-Bus library holds
-  its object tree while a getter runs. An item created elsewhere therefore shows
-  up in `Items` after the next search.
+  that currently have an object. Objects are exported by `SearchItems` and
+  `CreateItem`; a property getter never exports objects because the D-Bus library
+  holds its object tree while a getter runs, and nothing scans the vault when the
+  daemon starts. An item created elsewhere, or before the daemon started, shows
+  up in `Items` after a search has found it.
 
 Session encryption: `plain` and `dh-ietf1024-sha256-aes128-cbc-pkcs7`.
 Unsupported algorithms return `org.freedesktop.DBus.Error.NotSupported`.
@@ -106,16 +106,40 @@ One secret is one Password item in the configured vault:
 - Field `attributes`: the attributes as one JSON object. A single field
   round-trips empty values and any characters exactly.
 - Fields `label` (the readable label) and `content_type`.
-- Tag `secret-service` (configurable).
+- Tags: `secret-service` (configurable) and `attrs:<attributes as compact JSON>`.
+  `op item list` returns tags, so the attributes of every item are known from one
+  listing without reading any item. 1Password keeps the tag text exactly (letter
+  case, non-ASCII, quotes, and over a kilobyte were checked).
 
-Reads load an index of the whole tagged set with two `op` calls
-(`op item list --tags ... --format json`, then `op item get - --format json`
-fed with that list) and keep it in memory for `cache_ttl`. Searches, secret
-reads, and replace checks use the index; any write invalidates it. Items whose
-title does not match their attributes, or whose attributes fall outside the
-allow list, are ignored. Concurrent requests share one load.
+Every call to the CLI costs seconds when it goes through Windows (measured at 1 to
+17 s per call), so the number of calls is what matters:
+
+- A search whose attributes are exactly those of an item reads that item by its
+  title (`op item get secret-service/<key>`), because the title is derived from
+  the key. Next to it runs one listing; a hit ignores the listing.
+- On a miss, the items whose `attrs:` tag contains every queried pair are read by
+  id, at most four at a time, and remembered. This is how clients that store more
+  attributes than they search with (Python's `keyring` adds `application`) are
+  found. A search that matches nothing costs one exact read and one listing, in
+  parallel.
+- An empty query, and any query while the full index is loaded, use the index of
+  the whole tagged set: the listing and then every item.
+- Results are cached in memory for `cache_ttl`: the listing, single items (also
+  the fact that an item does not exist), and the index. Concurrent requests share
+  one read or listing. Any write invalidates the caches. Items whose title does
+  not match their attributes, or whose attributes fall outside the allow list, are
+  ignored.
+- Parallel reads are capped at four: with eight at once about half of the calls
+  failed because the 1Password app rejects bursts. A call that fails with
+  `error initializing client` or a message that CLI integration is not running is
+  retried twice.
 
 Deleting an item moves it to the 1Password archive.
+
+Replacing an item always sends the complete field set. The real
+`op item edit <item> -` replaces the custom fields with those of the template
+instead of merging them, so a partial template would silently drop the rest.
+The fake `op` used in the tests reproduces this behavior.
 
 `CreateItem` with `replace = true` replaces the item with the same attributes;
 without `replace`, a collision returns the existing item, as most
@@ -153,7 +177,7 @@ account = ""                  # optional, passed as --account
 mode = "auto"                 # auto | app | service-account
 tag = "secret-service"
 cache_ttl = "5m"
-idle_timeout = "15m"
+idle_timeout = "1h"
 allow = []                    # empty: everything; otherwise attribute patterns, e.g. "service=gh:*"
 log_level = "info"
 
@@ -166,8 +190,11 @@ service_account_token_env = ""    # environment variable name
 
 `op-secretd config init` writes a commented file. `op-secretd doctor` checks
 that `op` is found, the vault is reachable, the token file permissions are
-correct, the bus name is free, and the session algorithms are supported. It
-prints a clear result and exits 0 only when everything is fine.
+correct, the bus name is free, and the session algorithms are supported. It also
+warns when `gh` or `glab` keep a token in a plaintext configuration file (only
+the file paths are reported, never values). It prints a clear result per check
+(`ok`, `warn`, or `FAIL`) and exits 0 unless a check failed; a warning does not
+fail it.
 
 ## Lifecycle
 
@@ -175,10 +202,11 @@ prints a clear result and exits 0 only when everything is fine.
   in the user's services directory) and a systemd user unit.
 - If the name `org.freedesktop.secrets` is already taken (gnome-keyring,
   KeePassXC), the daemon does not start and reports who owns it.
-- After `idle_timeout` without requests the daemon exits; the cache disappears
-  with it. A request that is still in flight, for example while 1Password waits
-  for an approval, keeps the daemon alive; the timeout starts when the last
-  request finishes. A single `op` call is abandoned after 120 seconds.
+- After `idle_timeout` (default one hour) without requests the daemon exits; the
+  cache disappears with it. A request that is still in flight, for example while
+  1Password waits for an approval, keeps the daemon alive; the timeout starts
+  when the last request finishes. A single `op` call is abandoned after 120
+  seconds.
 
 ## Errors and security
 
@@ -186,8 +214,13 @@ prints a clear result and exits 0 only when everything is fine.
   client receives a D-Bus error. An empty "secret not found" answer is allowed
   only when the item truly does not exist. This keeps a client from silently
   falling back to a plaintext file. An integration test pins this behavior at
-  the protocol level; how the real `gh` reacts is a manual check (see
-  "Verify during implementation").
+  the protocol level.
+- The real `gh` and `glab` nevertheless fall back silently: when writing to the
+  keyring fails (the daemon is down, 1Password is unreachable, an approval was
+  declined), `gh auth login` stores the token in `hosts.yml` and exits 0 with no
+  warning. `gh` has `--insecure-storage` but no switch that forbids the fallback,
+  so the daemon cannot prevent it. The mitigation is procedural: log in only while
+  `doctor` is green, and `doctor` warns about plaintext tokens afterwards.
 - Secrets are held in `zeroize` buffers, never written to disk, and never logged;
   logs contain only identifiers and attribute hashes, not values.
 - Any process in the session that can talk to the bus can read the secrets, as
@@ -198,14 +231,16 @@ prints a clear result and exits 0 only when everything is fine.
 
 ## Testing
 
-- Unit: attribute canonicalization, crypto (known vectors), cache and TTL,
-  config parsing, WSL detection, `op.exe` lookup.
+- Unit: attribute canonicalization and tags, crypto (known vectors), cache and TTL,
+  config parsing, WSL detection, `op.exe` lookup, and the detection of plaintext
+  `gh` and `glab` tokens on mock configuration files (values are never printed).
 - Integration: a private `dbus-daemon`, a fake `op` (a Python script emulating
   `vault get` and `item list|get|create|edit|delete` on a file store, with
-  switches that make it fail or stall), the real daemon binary, and clients:
-  a Rust client that speaks the protocol directly (plain and DH sessions, error
-  paths, concurrency, empty, large, and binary secrets), the Go `go-keyring`
-  library that the GitHub and GitLab CLIs use, Python's `keyring`
+  switches that make it fail or stall, and with the field-replacing edit
+  semantics of the real `op`, which its own tests pin), the real daemon binary,
+  and clients: a Rust client that speaks the protocol directly (plain and DH
+  sessions, error paths, concurrency, empty, large, and binary secrets), the Go
+  `go-keyring` library that the GitHub and GitLab CLIs use, Python's `keyring`
   (SecretStorage), and `secret-tool`. Tests never touch the real 1Password or
   user directories: every XDG variable points into a temporary directory.
 - Manual checklist (not in CI): the real `op.exe` on WSL, a service account,
@@ -269,26 +304,62 @@ Client setup after installation: `gh auth login` and
 1Password. For `glab`, a personal access token is used instead of OAuth because
 OAuth access tokens expire quickly.
 
-## Verify during implementation
+## Verified manually against real services
 
-These points are not settled up front and are resolved by tests or documentation:
+Checked on 2026-10-05 and 2026-10-06 against a real 1Password account (WSL, Windows `op.exe`)
+with a throwaway vault, which was deleted afterwards:
 
-1. How `gh` reacts to a Secret Service error (silent fallback to a file or an
-   explicit failure). A fallback needs a workaround.
-2. Whether `az devops` and Git Credential Manager work with the API subset above
+- `doctor`, the Python `keyring` (DH session) and Go `go-keyring` clients, secrets
+  of 64 KiB and non-UTF-8 secrets, deletion into the archive, and cache refresh
+  after an edit made outside the daemon all work.
+- A failing vault and a declined approval prompt reach the client as a D-Bus
+  error with a clear message; nothing is written in plaintext by the daemon.
+- A systemd user unit with `Type=dbus`, D-Bus activation, idle exit, and the
+  refusal to start next to another provider work. The packaged unit uses a
+  private `/tmp`, so the configuration must not live there. After a failed start
+  the next activation can wait for the bus's 120 s timeout until the unit is
+  started once by hand.
+- `gh` (web login): the token is stored in the vault, `hosts.yml` holds none,
+  `gh api user` and a `git clone` of a private repository through
+  `gh auth git-credential` work, and `gh auth logout` removes the item.
+- `glab` (device login): both the access token and the OAuth refresh token are
+  stored in the vault, the configuration file holds neither, and `glab api user`
+  works. Whether a refreshed token round-trips after its two-hour expiry was not
+  waited for.
+- `gh` falls back to plaintext when the keyring write fails (see "Errors and
+  security").
+- A real vault accepts the item template the daemon sends: custom fields without
+  ids on create, the complete field set and the attribute tag on edit, and titles
+  and tags that carry quotes, backslashes, non-ASCII text, and over a kilobyte.
+- `secret-tool` stores, looks up, searches, and clears; `gh` re-login over an
+  existing plaintext token moves it into the vault; `glab` refreshes an expired
+  OAuth token through the keyring (access and refresh token are both replaced);
+  `git clone` of a private GitLab repository through `glab auth git-credential`
+  works. `glab` also falls back to a plaintext token when the keyring is
+  unavailable, but prints a warning.
+- Latency, with 1Password calls taking 5 to 17 s each through `op.exe`: a cold
+  exact lookup costs about one call (9 s, was 21 s with a scan), a first-login miss
+  8 s (was a 25 s client timeout), a cold subset search with four matches 17 s,
+  and every warm request is instant. Eight parallel `op.exe` calls failed half the
+  time; four did not.
+
+## Open verification points
+
+These points are not settled and are resolved by tests or documentation:
+
+1. Whether `az devops` and Git Credential Manager work with the API subset above
    (the Go `go-keyring` library and Python's SecretStorage are covered by tests).
-3. Whether `glab` stores an OAuth refresh token in the keyring; in any case we
-   move to a PAT.
-4. Whether the two-call index load (`op item list ... | op item get -`) is fast
-   enough with several hundred items.
-5. How the 1Password app handles approval prompts for a burst of quick requests
-   through `op.exe` (request debouncing).
-6. Whether a real 1Password vault accepts the item template that the daemon
-   sends (custom fields without ids on create, fields addressed by id on edit)
-   and what its limits are for large field values.
-7. How release-please behaves on its first run with `draft` and
+2. How the 1Password app behaves under a long burst of requests, and how a cold
+   subset search scales with hundreds of matching items (each match is one call,
+   four at a time).
+3. The limits of a real vault for field values larger than 64 KiB.
+4. How release-please behaves on its first run with `draft` and
    `force-tag-creation` (tag creation, the release pull request, and the next
    run seeing the draft).
+5. Service account mode and the native Linux `op` signed in with an account.
+6. Whether the D-Bus call timeouts of clients (25 s for libsecret) are enough when
+   1Password is slow: a login that needs a miss, a read, and a create sat close to
+   that limit on a slow day.
 
 ## Phase 2
 
