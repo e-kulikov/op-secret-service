@@ -62,12 +62,16 @@ def load_all():
     return out
 
 
-def find(title):
-    path = path_for(title)
-    if not os.path.exists(path):
-        fail('"%s" isn\'t an item in the "%s" vault. Specify the item with its UUID, name, or domain.' % (title, vault))
-    with open(path) as handle:
-        return json.load(handle)
+def find(reference):
+    """An item by title, or by id (the real op accepts both)."""
+    path = path_for(reference)
+    if os.path.exists(path):
+        with open(path) as handle:
+            return json.load(handle)
+    for item in load_all():
+        if item["id"] == reference:
+            return item
+    fail('"%s" isn\'t an item in the "%s" vault. Specify the item with its UUID, name, or domain.' % (reference, vault))
 
 
 def counter():

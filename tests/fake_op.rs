@@ -103,3 +103,22 @@ fn a_complete_template_edit_keeps_every_field() {
         .unwrap();
     assert_eq!(password["value"], "new");
 }
+
+#[test]
+fn an_item_can_be_fetched_by_its_id_as_well_as_by_its_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let created: serde_json::Value = serde_json::from_str(&fake(
+        dir.path(),
+        &["item", "create", "--vault", "V", "-"],
+        Some(CREATE),
+    ))
+    .unwrap();
+    let id = created["id"].as_str().unwrap();
+    let by_id: serde_json::Value = serde_json::from_str(&fake(
+        dir.path(),
+        &["item", "get", id, "--vault", "V", "--format", "json"],
+        None,
+    ))
+    .unwrap();
+    assert_eq!(by_id["title"], "t");
+}
