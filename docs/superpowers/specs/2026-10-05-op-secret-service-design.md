@@ -84,11 +84,11 @@ The implementation covers the minimum needed by the target clients:
 - `GetSecret` replies with a single `(oayays)` structure; clients such as
   go-keyring reject a reply whose structure is flattened into four arguments.
 - `Created` and `Modified` are always `0`. `Collection.Items` lists the items
-  that currently have an object. Objects are exported by `SearchItems`,
-  `CreateItem`, and once in the background right after the daemon claims the bus
-  name; a property getter never exports objects because the D-Bus library holds
-  its object tree while a getter runs. An item created elsewhere therefore shows
-  up in `Items` after the next search.
+  that currently have an object. Objects are exported by `SearchItems` and
+  `CreateItem`; a property getter never exports objects because the D-Bus library
+  holds its object tree while a getter runs, and nothing scans the vault when the
+  daemon starts. An item created elsewhere, or before the daemon started, shows
+  up in `Items` after a search has found it.
 
 Session encryption: `plain` and `dh-ietf1024-sha256-aes128-cbc-pkcs7`.
 Unsupported algorithms return `org.freedesktop.DBus.Error.NotSupported`.
@@ -106,14 +106,33 @@ One secret is one Password item in the configured vault:
 - Field `attributes`: the attributes as one JSON object. A single field
   round-trips empty values and any characters exactly.
 - Fields `label` (the readable label) and `content_type`.
-- Tag `secret-service` (configurable).
+- Tags: `secret-service` (configurable) and `attrs:<attributes as compact JSON>`.
+  `op item list` returns tags, so the attributes of every item are known from one
+  listing without reading any item. 1Password keeps the tag text exactly (letter
+  case, non-ASCII, quotes, and over a kilobyte were checked).
 
-Reads load an index of the whole tagged set with two `op` calls
-(`op item list --tags ... --format json`, then `op item get - --format json`
-fed with that list) and keep it in memory for `cache_ttl`. Searches, secret
-reads, and replace checks use the index; any write invalidates it. Items whose
-title does not match their attributes, or whose attributes fall outside the
-allow list, are ignored. Concurrent requests share one load.
+Every call to the CLI costs seconds when it goes through Windows (measured at 1 to
+17 s per call), so the number of calls is what matters:
+
+- A search whose attributes are exactly those of an item reads that item by its
+  title (`op item get secret-service/<key>`), because the title is derived from
+  the key. Next to it runs one listing; a hit ignores the listing.
+- On a miss, the items whose `attrs:` tag contains every queried pair are read by
+  id, at most four at a time, and remembered. This is how clients that store more
+  attributes than they search with (Python's `keyring` adds `application`) are
+  found. A search that matches nothing costs one exact read and one listing, in
+  parallel.
+- An empty query, and any query while the full index is loaded, use the index of
+  the whole tagged set: the listing and then every item.
+- Results are cached in memory for `cache_ttl`: the listing, single items (also
+  the fact that an item does not exist), and the index. Concurrent requests share
+  one read or listing. Any write invalidates the caches. Items whose title does
+  not match their attributes, or whose attributes fall outside the allow list, are
+  ignored.
+- Parallel reads are capped at four: with eight at once about half of the calls
+  failed because the 1Password app rejects bursts. A call that fails with
+  `error initializing client` or a message that CLI integration is not running is
+  retried twice.
 
 Deleting an item moves it to the 1Password archive.
 
@@ -183,10 +202,11 @@ fail it.
   in the user's services directory) and a systemd user unit.
 - If the name `org.freedesktop.secrets` is already taken (gnome-keyring,
   KeePassXC), the daemon does not start and reports who owns it.
-- After `idle_timeout` without requests the daemon exits; the cache disappears
-  with it. A request that is still in flight, for example while 1Password waits
-  for an approval, keeps the daemon alive; the timeout starts when the last
-  request finishes. A single `op` call is abandoned after 120 seconds.
+- After `idle_timeout` (default one hour) without requests the daemon exits; the
+  cache disappears with it. A request that is still in flight, for example while
+  1Password waits for an approval, keeps the daemon alive; the timeout starts
+  when the last request finishes. A single `op` call is abandoned after 120
+  seconds.
 
 ## Errors and security
 
@@ -211,7 +231,7 @@ fail it.
 
 ## Testing
 
-- Unit: attribute canonicalization, crypto (known vectors), cache and TTL,
+- Unit: attribute canonicalization and tags, crypto (known vectors), cache and TTL,
   config parsing, WSL detection, `op.exe` lookup, and the detection of plaintext
   `gh` and `glab` tokens on mock configuration files (values are never printed).
 - Integration: a private `dbus-daemon`, a fake `op` (a Python script emulating
@@ -286,7 +306,7 @@ OAuth access tokens expire quickly.
 
 ## Verified manually against real services
 
-Checked on 2026-10-05 against a real 1Password account (WSL, Windows `op.exe`)
+Checked on 2026-10-05 and 2026-10-06 against a real 1Password account (WSL, Windows `op.exe`)
 with a throwaway vault, which was deleted afterwards:
 
 - `doctor`, the Python `keyring` (DH session) and Go `go-keyring` clients, secrets
@@ -309,7 +329,19 @@ with a throwaway vault, which was deleted afterwards:
 - `gh` falls back to plaintext when the keyring write fails (see "Errors and
   security").
 - A real vault accepts the item template the daemon sends: custom fields without
-  ids on create, the complete field set on edit.
+  ids on create, the complete field set and the attribute tag on edit, and titles
+  and tags that carry quotes, backslashes, non-ASCII text, and over a kilobyte.
+- `secret-tool` stores, looks up, searches, and clears; `gh` re-login over an
+  existing plaintext token moves it into the vault; `glab` refreshes an expired
+  OAuth token through the keyring (access and refresh token are both replaced);
+  `git clone` of a private GitLab repository through `glab auth git-credential`
+  works. `glab` also falls back to a plaintext token when the keyring is
+  unavailable, but prints a warning.
+- Latency, with 1Password calls taking 5 to 17 s each through `op.exe`: a cold
+  exact lookup costs about one call (9 s, was 21 s with a scan), a first-login miss
+  8 s (was a 25 s client timeout), a cold subset search with four matches 17 s,
+  and every warm request is instant. Eight parallel `op.exe` calls failed half the
+  time; four did not.
 
 ## Open verification points
 
@@ -317,14 +349,17 @@ These points are not settled and are resolved by tests or documentation:
 
 1. Whether `az devops` and Git Credential Manager work with the API subset above
    (the Go `go-keyring` library and Python's SecretStorage are covered by tests).
-2. Whether the two-call index load (`op item list ... | op item get -`) is fast
-   enough with several hundred items, and how the 1Password app handles a burst
-   of quick requests through `op.exe`.
+2. How the 1Password app behaves under a long burst of requests, and how a cold
+   subset search scales with hundreds of matching items (each match is one call,
+   four at a time).
 3. The limits of a real vault for field values larger than 64 KiB.
 4. How release-please behaves on its first run with `draft` and
    `force-tag-creation` (tag creation, the release pull request, and the next
    run seeing the draft).
 5. Service account mode and the native Linux `op` signed in with an account.
+6. Whether the D-Bus call timeouts of clients (25 s for libsecret) are enough when
+   1Password is slow: a login that needs a miss, a read, and a create sat close to
+   that limit on a slow day.
 
 ## Phase 2
 

@@ -22,7 +22,8 @@ command line tool:
 - **Service account:** a service account token can be used instead of the app.
 
 Every secret is one Password item in a dedicated vault, titled
-`secret-service/<hash of its attributes>` and tagged `secret-service`. Items are
+`secret-service/<hash of its attributes>` and tagged `secret-service` plus a tag that
+records its attributes, so a search needs one listing instead of reading every item. Items are
 cached in memory for `cache_ttl`; nothing is written to disk. The daemon starts
 on demand and exits after `idle_timeout` without requests.
 
@@ -107,6 +108,10 @@ forbids the fallback, so the daemon cannot prevent it. After logging in, make su
 
 ## Troubleshooting
 
+- **The first request after the daemon starts takes several seconds:** every call to
+  the 1Password CLI goes through the app (and through Windows in WSL) and can take
+  seconds. Results are then cached for `cache_ttl`, and the daemon stays up for
+  `idle_timeout`, so later requests are instant.
 - **A client fails with `authorization prompt dismissed`:** the approval prompt in
   the 1Password app was closed or the app was locked and not unlocked. Retry the
   command and approve the prompt.
