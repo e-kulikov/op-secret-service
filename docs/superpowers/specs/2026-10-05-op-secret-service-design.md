@@ -158,7 +158,7 @@ account = ""                  # optional, passed as --account
 mode = "auto"                 # auto | app | service-account
 tag = "secret-service"
 cache_ttl = "5m"
-idle_timeout = "15m"
+idle_timeout = "1h"
 allow = []                    # empty: everything; otherwise attribute patterns, e.g. "service=gh:*"
 log_level = "info"
 

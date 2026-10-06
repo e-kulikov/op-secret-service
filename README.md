@@ -72,7 +72,7 @@ client asks for the keyring.
 | `mode` | `auto` | `auto`, `app` or `service-account`. |
 | `tag` | `secret-service` | Tag put on every item. |
 | `cache_ttl` | `5m` | In-memory cache lifetime; `0` disables it. |
-| `idle_timeout` | `15m` | Exit after this long without requests; `0` disables it. |
+| `idle_timeout` | `1h` | Exit after this long without requests; `0` disables it. |
 | `allow` | empty | Attribute patterns (`key=glob`); empty accepts everything. |
 | `log_level` | `info` | `error`, `warn`, `info`, `debug` or `trace`. |
 | `[op] binary` | `auto` | Path of `op` or `op.exe`. |

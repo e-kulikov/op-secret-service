@@ -130,7 +130,7 @@ impl Default for Config {
             mode: Mode::Auto,
             tag: "secret-service".into(),
             cache_ttl: Duration::from_secs(300),
-            idle_timeout: Duration::from_secs(900),
+            idle_timeout: Duration::from_secs(3600),
             allow: Vec::new(),
             log_level: "info".into(),
             op: OpConfig::default(),
@@ -159,7 +159,7 @@ tag = "secret-service"
 cache_ttl = "5m"
 
 # The daemon exits after this long without requests. "0" disables it.
-idle_timeout = "15m"
+idle_timeout = "1h"
 
 # Attribute patterns (key=glob). Empty means everything is accepted.
 # Example: allow = ["service=gh:*", "service=glab*"]
@@ -296,8 +296,18 @@ mod tests {
         assert_eq!(config.vault, "Secret Service");
         assert_eq!(config.mode, Mode::Auto);
         assert_eq!(config.cache_ttl, Duration::from_secs(300));
-        assert_eq!(config.idle_timeout, Duration::from_secs(900));
+        assert_eq!(config.idle_timeout, Duration::from_secs(3600));
         assert_eq!(config.op.wsl_interop, Interop::Auto);
+    }
+
+    #[test]
+    fn the_example_matches_the_defaults() {
+        let example = Config::from_toml(EXAMPLE).unwrap();
+        let defaults = Config::default();
+        assert_eq!(example.cache_ttl, defaults.cache_ttl);
+        assert_eq!(example.idle_timeout, defaults.idle_timeout);
+        assert_eq!(example.tag, defaults.tag);
+        assert_eq!(defaults.idle_timeout, Duration::from_secs(3600));
     }
 
     #[test]
