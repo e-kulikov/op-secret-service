@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use zeroize::Zeroizing;
 
 use crate::config::{Config, Interop, Mode};
@@ -183,11 +185,111 @@ pub fn resolve(config: &Config, probe: &Probe) -> Result<Launch> {
     Ok(Launch::Native(native()?))
 }
 
+/// How long after a successful call the CLI is assumed to stay authorized.
+const AUTH_WINDOW: Duration = Duration::from_secs(300);
+
+/// Why the call at the front of the queue failed.
+#[derive(Clone)]
+enum Failure {
+    Failed(String),
+    Unavailable(String),
+}
+
+impl Failure {
+    fn error(&self) -> Error {
+        match self {
+            Failure::Failed(message) => Error::OpFailed(message.clone()),
+            Failure::Unavailable(message) => Error::OpUnavailable(message.clone()),
+        }
+    }
+}
+
+struct GateState {
+    last_success: Option<Instant>,
+    failure: Option<(Instant, Failure)>,
+}
+
+/// Lets one call at a time through while the CLI may need an approval.
+///
+/// After a pause the first call can make 1Password ask the user to unlock or
+/// approve, and every `op` process asks for itself, so several calls started
+/// together would show several prompts. Until a call has succeeded, calls queue
+/// up behind the first one; calls queued behind a failed one fail with its error
+/// instead of prompting again. Once a call succeeds, calls run in parallel.
+struct Gate {
+    window: Duration,
+    state: StdMutex<GateState>,
+    cold: Arc<Mutex<()>>,
+}
+
+enum Entry {
+    /// The CLI is authorized; run freely.
+    Open,
+    /// This call goes first and holds the gate until it is done.
+    First(OwnedMutexGuard<()>),
+    /// The call in front of this one failed.
+    Failed(Error),
+}
+
+impl Gate {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            state: StdMutex::new(GateState {
+                last_success: None,
+                failure: None,
+            }),
+            cold: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn is_open(&self, state: &GateState) -> bool {
+        state
+            .last_success
+            .is_some_and(|at| at.elapsed() < self.window)
+    }
+
+    async fn enter(&self, queued_at: Instant) -> Entry {
+        if self.is_open(&self.state.lock().expect("gate lock")) {
+            return Entry::Open;
+        }
+        let guard = self.cold.clone().lock_owned().await;
+        let state = self.state.lock().expect("gate lock");
+        if self.is_open(&state) {
+            return Entry::Open;
+        }
+        match &state.failure {
+            Some((at, failure)) if *at >= queued_at => Entry::Failed(failure.error()),
+            _ => Entry::First(guard),
+        }
+    }
+
+    /// Records the outcome. An answer that the item does not exist proves that
+    /// the CLI was authorized.
+    fn record(&self, result: &Result<Vec<u8>>, was_first: bool) {
+        let mut state = self.state.lock().expect("gate lock");
+        match result {
+            Ok(_) | Err(Error::NotFound) => {
+                state.last_success = Some(Instant::now());
+                state.failure = None;
+            }
+            Err(Error::OpFailed(message)) if was_first => {
+                state.failure = Some((Instant::now(), Failure::Failed(message.clone())));
+            }
+            Err(Error::OpUnavailable(message)) if was_first => {
+                state.failure = Some((Instant::now(), Failure::Unavailable(message.clone())));
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 /// Runs `op` with a fixed launch method and optional `--account`.
 #[derive(Clone)]
 pub struct OpRunner {
     launch: Launch,
     account: Option<String>,
+    gate: Arc<Gate>,
 }
 
 fn first_error_line(stderr: &[u8]) -> String {
@@ -205,6 +307,15 @@ impl OpRunner {
         Self {
             launch,
             account: account.filter(|account| !account.is_empty()),
+            gate: Arc::new(Gate::new(AUTH_WINDOW)),
+        }
+    }
+
+    /// How long a successful call keeps the gate open (five minutes by default).
+    pub fn with_auth_window(self, window: Duration) -> Self {
+        Self {
+            gate: Arc::new(Gate::new(window)),
+            ..self
         }
     }
 
@@ -228,8 +339,21 @@ impl OpRunner {
     }
 
     /// Runs the CLI and returns stdout. `stdin` is passed as the child's standard
-    /// input. Transient client errors are retried a couple of times.
+    /// input. Transient client errors are retried a couple of times. While the CLI
+    /// may need an approval, calls go through the gate one at a time (see `Gate`).
     pub async fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+        let queued_at = Instant::now();
+        let first = match self.gate.enter(queued_at).await {
+            Entry::Open => None,
+            Entry::First(guard) => Some(guard),
+            Entry::Failed(error) => return Err(error),
+        };
+        let result = self.run_with_retries(args, stdin).await;
+        self.gate.record(&result, first.is_some());
+        result
+    }
+
+    async fn run_with_retries(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
         let mut attempt = 0;
         loop {
             match self.run_once(args, stdin).await {
@@ -627,5 +751,154 @@ echo ok"#
             other => panic!("unexpected: {other:?}"),
         }
         assert_eq!(runs(&op), 3, "one attempt and two retries");
+    }
+
+    /// A stand-in `op` that logs `start`/`end` lines. `behavior` is shell code that
+    /// runs after the log line `start` with `$n` set to the number of runs so far.
+    fn logging_op(dir: &Path, behavior: &str) -> PathBuf {
+        let op = dir.join("op");
+        make_exe(
+            &op,
+            &format!(
+                r#"log="$0.log"; echo "start $$" >> "$log"
+n=$(grep -c '^start' "$log")
+sleep 0.3
+{behavior}
+echo "end $$" >> "$log""#
+            ),
+        );
+        op
+    }
+
+    fn events(op: &Path) -> Vec<String> {
+        fs::read_to_string(format!("{}.log", op.display()))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.split(' ').next().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The highest number of runs that were in progress at the same time.
+    fn peak(events: &[String]) -> usize {
+        let (mut running, mut peak) = (0usize, 0usize);
+        for event in events {
+            if event == "start" {
+                running += 1;
+                peak = peak.max(running);
+            } else {
+                running -= 1;
+            }
+        }
+        peak
+    }
+
+    const OK: &str = "echo ok";
+
+    #[tokio::test]
+    async fn the_first_calls_after_a_pause_start_with_one_that_runs_alone() {
+        // Each process asks for its own approval when 1Password is locked, so the
+        // first call must finish before the others start.
+        let dir = tempfile::tempdir().unwrap();
+        let op = logging_op(dir.path(), OK);
+        let runner = OpRunner::new(Launch::Native(op.clone()), None);
+        let results = tokio::join!(
+            runner.run(&["a"], None),
+            runner.run(&["b"], None),
+            runner.run(&["c"], None),
+            runner.run(&["d"], None)
+        );
+        assert!(results.0.is_ok() && results.1.is_ok() && results.2.is_ok() && results.3.is_ok());
+        let log = events(&op);
+        assert_eq!(
+            &log[..2],
+            ["start", "end"],
+            "the first call runs alone: {log:?}"
+        );
+        assert!(
+            peak(&log) >= 2,
+            "once one call succeeded the others run together: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_queued_behind_a_failed_first_call_fail_with_its_error_without_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = logging_op(
+            dir.path(),
+            "echo '[ERROR] authorization prompt dismissed' >&2; exit 1",
+        );
+        let runner = OpRunner::new(Launch::Native(op.clone()), None);
+        let results = tokio::join!(
+            runner.run(&["a"], None),
+            runner.run(&["b"], None),
+            runner.run(&["c"], None)
+        );
+        for result in [results.0, results.1, results.2] {
+            match result {
+                Err(Error::OpFailed(message)) => {
+                    assert!(
+                        message.contains("authorization prompt dismissed"),
+                        "{message}"
+                    )
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(
+            events(&op).iter().filter(|e| *e == "start").count(),
+            1,
+            "no prompt storm"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_call_tries_again_after_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = logging_op(
+            dir.path(),
+            r#"if [ "$n" -le 1 ]; then echo '[ERROR] authorization prompt dismissed' >&2; exit 1; fi; echo ok"#,
+        );
+        let runner = OpRunner::new(Launch::Native(op.clone()), None);
+        assert!(runner.run(&["a"], None).await.is_err());
+        assert_eq!(runner.run(&["b"], None).await.unwrap(), b"ok\n");
+        assert_eq!(events(&op).iter().filter(|e| *e == "start").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_gate_closes_again_after_a_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = logging_op(dir.path(), OK);
+        let runner = OpRunner::new(Launch::Native(op.clone()), None)
+            .with_auth_window(Duration::from_millis(150));
+        runner.run(&["warm"], None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = tokio::join!(
+            runner.run(&["a"], None),
+            runner.run(&["b"], None),
+            runner.run(&["c"], None)
+        );
+        let log = events(&op);
+        // [start, end] of the warm-up call, then the first call after the pause alone.
+        assert_eq!(&log[2..4], ["start", "end"], "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_the_item_is_missing_counts_as_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = logging_op(
+            dir.path(),
+            r#"if [ "$n" -le 1 ]; then echo "[ERROR] \"x\" isn't an item in the \"V\" vault." >&2; exit 1; fi; echo ok"#,
+        );
+        let runner = OpRunner::new(Launch::Native(op.clone()), None);
+        assert!(matches!(
+            runner.run(&["a"], None).await,
+            Err(Error::NotFound)
+        ));
+        let _ = tokio::join!(
+            runner.run(&["b"], None),
+            runner.run(&["c"], None),
+            runner.run(&["d"], None)
+        );
+        assert!(peak(&events(&op)) >= 2, "{:?}", events(&op));
     }
 }
