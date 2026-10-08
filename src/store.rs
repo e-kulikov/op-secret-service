@@ -319,13 +319,13 @@ impl Store {
     /// every item whose attributes contain them.
     async fn search_cold(&self, query: &Attributes) -> Result<Vec<ItemInfo>> {
         let key = item_key(query);
-        // The exact read and the listing run side by side; the listing only
-        // matters on a miss, and each call costs seconds through Windows.
-        let (exact, entries) = tokio::join!(self.fetch_one(&key), self.entries());
-        if let Some(record) = exact? {
+        // The exact read goes first: a hit needs nothing else, and when 1Password
+        // asks for an approval the user sees one prompt instead of one per process.
+        if let Some(record) = self.fetch_one(&key).await? {
             return Ok(vec![record.info]);
         }
-        let candidates: Vec<Entry> = entries?
+        let entries = self.entries().await?;
+        let candidates: Vec<Entry> = entries
             .into_iter()
             .filter(|entry| {
                 entry.key != key
@@ -918,7 +918,11 @@ mod tests {
                 .any(|call| call.starts_with(&format!("item get secret-service/{key}"))),
             "{log:?}"
         );
-        assert!(count(&log, "item list") <= 1, "{log:?}");
+        assert_eq!(
+            count(&log, "item list"),
+            0,
+            "a hit needs no listing: {log:?}"
+        );
 
         assert_eq!(&*cold.secret(&key).await.unwrap().0, b"tok");
         assert_eq!(
@@ -1048,7 +1052,11 @@ mod tests {
         }
         let log = calls(dir.path());
         assert_eq!(count(&log, "item get"), 1, "one shared read: {log:?}");
-        assert_eq!(count(&log, "item list"), 1, "one shared listing: {log:?}");
+        assert_eq!(
+            count(&log, "item list"),
+            0,
+            "a hit needs no listing: {log:?}"
+        );
     }
 
     #[tokio::test]

@@ -116,12 +116,12 @@ Every call to the CLI costs seconds when it goes through Windows (measured at 1 
 
 - A search whose attributes are exactly those of an item reads that item by its
   title (`op item get secret-service/<key>`), because the title is derived from
-  the key. Next to it runs one listing; a hit ignores the listing.
+  the key. A hit needs nothing else; only a miss is followed by one listing.
 - On a miss, the items whose `attrs:` tag contains every queried pair are read by
   id, at most four at a time, and remembered. This is how clients that store more
   attributes than they search with (Python's `keyring` adds `application`) are
-  found. A search that matches nothing costs one exact read and one listing, in
-  parallel.
+  found. A search that matches nothing costs one exact read followed by one
+  listing.
 - An empty query, and any query while the full index is loaded, use the index of
   the whole tagged set: the listing and then every item.
 - Results are cached in memory for `cache_ttl`: the listing, single items (also
@@ -129,6 +129,13 @@ Every call to the CLI costs seconds when it goes through Windows (measured at 1 
   one read or listing. Any write invalidates the caches. Items whose title does
   not match their attributes, or whose attributes fall outside the allow list, are
   ignored.
+- Approval prompts are shown once. After a pause the first call to the CLI can
+  make 1Password ask the user to unlock or approve, and every `op` process asks
+  for itself, so calls started together would show one window each. Until a call
+  has succeeded (an answer that the item does not exist also proves the CLI is
+  authorized), calls go through a gate one at a time; calls queued behind a failed
+  one fail with its error instead of prompting again. After a success calls run in
+  parallel for five minutes, and a longer pause closes the gate again.
 - Parallel reads are capped at four: with eight at once about half of the calls
   failed because the 1Password app rejects bursts. A call that fails with
   `error initializing client` or a message that CLI integration is not running is
