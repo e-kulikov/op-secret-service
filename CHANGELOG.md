@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/e-kulikov/op-secret-service/compare/v0.1.0...v0.1.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* **op:** ask for one approval after a pause instead of one per process ([d31735e](https://github.com/e-kulikov/op-secret-service/commit/d31735e3cbce453bc8747cbb07a08b79aabe36e1))
+* **op:** ask for one approval after a pause instead of one per process ([7ceb101](https://github.com/e-kulikov/op-secret-service/commit/7ceb10180c016b855849fa3ab2f9739374ea3037))
+
 ## 0.1.0 (2026-10-06)
 
 
